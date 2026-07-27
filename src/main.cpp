@@ -325,7 +325,18 @@ private:
         ci.pApplicationInfo = &ai;
         ci.enabledExtensionCount = (uint32_t)exts.size(); ci.ppEnabledExtensionNames = exts.data();
         const char* layer = "VK_LAYER_KHRONOS_validation";
-        ci.enabledLayerCount = 1; ci.ppEnabledLayerNames = &layer;
+        uint32_t layerCount = 0;
+        vkEnumerateInstanceLayerProperties(&layerCount, nullptr);
+        std::vector<VkLayerProperties> availLayers(layerCount);
+        vkEnumerateInstanceLayerProperties(&layerCount, availLayers.data());
+        bool hasValidation = false;
+        for (auto& l : availLayers) {
+            if (strcmp(l.layerName, layer) == 0) { hasValidation = true; break; }
+        }
+        std::vector<const char*> enabledLayers;
+        if (hasValidation) enabledLayers.push_back(layer);
+        ci.enabledLayerCount = (uint32_t)enabledLayers.size();
+        ci.ppEnabledLayerNames = enabledLayers.data();
 
         // Debug messenger create info
         VkDebugUtilsMessengerCreateInfoEXT dbgCI{};
@@ -335,12 +346,14 @@ private:
         dbgCI.messageType = VK_DEBUG_UTILS_MESSAGE_TYPE_GENERAL_BIT_EXT
             | VK_DEBUG_UTILS_MESSAGE_TYPE_VALIDATION_BIT_EXT;
         dbgCI.pfnUserCallback = debugCallback;
-        ci.pNext = &dbgCI;
+        if (hasValidation) ci.pNext = &dbgCI;
 
         vkCreateInstance(&ci, nullptr, &instance);
-        auto vkCreateDebugUtilsMessengerEXT = (PFN_vkCreateDebugUtilsMessengerEXT)
-            vkGetInstanceProcAddr(instance, "vkCreateDebugUtilsMessengerEXT");
-        vkCreateDebugUtilsMessengerEXT(instance, &dbgCI, nullptr, &debugMsgr);
+        if (hasValidation) {
+            auto vkCreateDebugUtilsMessengerEXT = (PFN_vkCreateDebugUtilsMessengerEXT)
+                vkGetInstanceProcAddr(instance, "vkCreateDebugUtilsMessengerEXT");
+            vkCreateDebugUtilsMessengerEXT(instance, &dbgCI, nullptr, &debugMsgr);
+        }
     }
 
     void createSurface() { glfwCreateWindowSurface(instance, window, nullptr, &surface); }
@@ -1072,9 +1085,11 @@ private:
         vkDestroySwapchainKHR(device, swapchain, nullptr);
         vkDestroyDevice(device, nullptr);
         vkDestroySurfaceKHR(instance, surface, nullptr);
-        auto vkDestroyDebugUtilsMessengerEXT = (PFN_vkDestroyDebugUtilsMessengerEXT)
-            vkGetInstanceProcAddr(instance, "vkDestroyDebugUtilsMessengerEXT");
-        vkDestroyDebugUtilsMessengerEXT(instance, debugMsgr, nullptr);
+        if (debugMsgr != VK_NULL_HANDLE) {
+            auto vkDestroyDebugUtilsMessengerEXT = (PFN_vkDestroyDebugUtilsMessengerEXT)
+                vkGetInstanceProcAddr(instance, "vkDestroyDebugUtilsMessengerEXT");
+            vkDestroyDebugUtilsMessengerEXT(instance, debugMsgr, nullptr);
+        }
         vkDestroyInstance(instance, nullptr);
         glfwDestroyWindow(window);
         glfwTerminate();
