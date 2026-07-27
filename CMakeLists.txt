@@ -13,8 +13,8 @@ find_package(Vulkan REQUIRED)
 # glm
 find_package(glm CONFIG REQUIRED)
 
-# OpenCV (optional - for shape classification)
-find_package(OpenCV QUIET)
+# GLFW
+find_package(glfw3 CONFIG REQUIRED)
 
 add_executable(imagemaker
     src/main.cpp
@@ -28,10 +28,5 @@ target_include_directories(imagemaker PRIVATE
 target_link_libraries(imagemaker PRIVATE
     Vulkan::Vulkan
     glm::glm-header-only
+    glfw
 )
-
-if(OpenCV_FOUND)
-    target_include_directories(imagemaker PRIVATE ${OpenCV_INCLUDE_DIRS})
-    target_link_libraries(imagemaker PRIVATE ${OpenCV_LIBS})
-    target_compile_definitions(imagemaker PRIVATE HAS_OPENCV)
-endif()
