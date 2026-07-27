@@ -144,9 +144,8 @@ private:
     Action selAction = ACT_NONE;
     int selObject = -1;  // -1: none, 0: first object
 
-    // Input state
-    bool keyXPressed = false, keyYPressed = false, keyZPressed = false;
-    bool keyRPressed = false, keyMPressed = false, keySPressed = false, keyTPressed = false;
+    // Input state (track pressed keys no longer needed - using select pattern)
+    // (keyPressed booleans removed — replaced by selectAxis/selectAction radio-toggle)
 
     // Mouse drag state (for stroke drawing)
     bool leftDragging = false;
@@ -176,13 +175,13 @@ private:
     static void keyCB(GLFWwindow* w, int key, int, int action, int) {
         auto* app = (VulkanApp*)glfwGetWindowUserPointer(w);
         if (action == GLFW_PRESS) {
-            if (key == GLFW_KEY_X) { app->keyXPressed = !app->keyXPressed; app->updateAxis(); }
-            if (key == GLFW_KEY_Y) { app->keyYPressed = !app->keyYPressed; app->updateAxis(); }
-            if (key == GLFW_KEY_Z) { app->keyZPressed = !app->keyZPressed; app->updateAxis(); }
-            if (key == GLFW_KEY_R) { app->keyRPressed = !app->keyRPressed; app->updateAction(); }
-            if (key == GLFW_KEY_M) { app->keyMPressed = !app->keyMPressed; app->updateAction(); }
-            if (key == GLFW_KEY_S) { app->keySPressed = !app->keySPressed; app->updateAction(); }
-            if (key == GLFW_KEY_T) { app->keyTPressed = !app->keyTPressed; app->updateAction(); }
+            if (key == GLFW_KEY_X) { app->selectAxis(AXIS_X); }
+            if (key == GLFW_KEY_Y) { app->selectAxis(AXIS_Y); }
+            if (key == GLFW_KEY_Z) { app->selectAxis(AXIS_Z); }
+            if (key == GLFW_KEY_R) { app->selectAction(ACT_ROTATE); }
+            if (key == GLFW_KEY_M) { app->selectAction(ACT_MOVE); }
+            if (key == GLFW_KEY_S) { app->selectAction(ACT_ORBIT); }
+            if (key == GLFW_KEY_T) { app->selectAction(ACT_ZOOM); }
             if (key == GLFW_KEY_EQUAL || key == GLFW_KEY_KP_ADD) app->applyDelta(0.1f);
             if (key == GLFW_KEY_MINUS || key == GLFW_KEY_KP_SUBTRACT) app->applyDelta(-0.1f);
             if (key == GLFW_KEY_ESCAPE) glfwSetWindowShouldClose(w, true);
@@ -245,19 +244,15 @@ private:
         app->lastMouseY = y;
     }
 
-    void updateAxis() {
-        if (keyXPressed) { keyYPressed = keyZPressed = false; selAxis = AXIS_X; }
-        else if (keyYPressed) { keyXPressed = keyZPressed = false; selAxis = AXIS_Y; }
-        else if (keyZPressed) { keyXPressed = keyYPressed = false; selAxis = AXIS_Z; }
-        else selAxis = AXIS_NONE;
+    // Key already pressed → toggle deselection; different key → switch
+    void selectAxis(Axis ax) {
+        if (selAxis == ax) selAxis = AXIS_NONE;
+        else selAxis = ax;
         updateTitle();
     }
-    void updateAction() {
-        if (keyRPressed) { keyMPressed = keySPressed = keyTPressed = false; selAction = ACT_ROTATE; }
-        else if (keyMPressed) { keyRPressed = keySPressed = keyTPressed = false; selAction = ACT_MOVE; }
-        else if (keySPressed) { keyRPressed = keyMPressed = keyTPressed = false; selAction = ACT_ORBIT; }
-        else if (keyTPressed) { keyRPressed = keyMPressed = keySPressed = false; selAction = ACT_ZOOM; }
-        else selAction = ACT_NONE;
+    void selectAction(Action act) {
+        if (selAction == act) selAction = ACT_NONE;
+        else selAction = act;
         updateTitle();
     }
 
