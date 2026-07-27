@@ -7,6 +7,8 @@
 #include <vulkan/vulkan.h>
 
 #include "mesh_generator.hpp"
+#include "mesh_postprocess.hpp"
+#include "gltf_export.hpp"
 #include "input.hpp"
 
 #include <cstring>
@@ -167,6 +169,11 @@ private:
     std::vector<Vertex> currentMeshVertices; // live mesh data (mutated by sculpt)
     std::vector<uint32_t> meshIndices;       // CPU copy of index buffer for ray tracing
 
+    // M4: Post-processing + export state
+    DecimatedMesh decimated;           // decimated version of current mesh
+    bool showDecimated = false;        // toggle: show decimated instead of original
+    std::string exportDir = "exports"; // output directory for glTF files
+
     // ─── Window ──────────────────────────────────────────────────────
     void initWindow() {
         glfwInit();
@@ -192,6 +199,8 @@ private:
             if (key == GLFW_KEY_T) { app->selectAction(ACT_ZOOM); }
             if (key == GLFW_KEY_U) { app->brushThickness = -app->brushThickness; }
             if (key == GLFW_KEY_B) { app->baseVertices = app->currentMeshVertices; }
+            if (key == GLFW_KEY_D) { app->toggleDecimate(); }
+            if (key == GLFW_KEY_E) { app->exportMesh(); }
             if (key == GLFW_KEY_EQUAL || key == GLFW_KEY_KP_ADD) app->applyDelta(0.1f);
             if (key == GLFW_KEY_MINUS || key == GLFW_KEY_KP_SUBTRACT) app->applyDelta(-0.1f);
             if (key == GLFW_KEY_ESCAPE) glfwSetWindowShouldClose(w, true);
@@ -284,9 +293,10 @@ private:
         const char* ax[] = {"none","X","Y","Z"};
         const char* ac[] = {"none","Rotate","Move","Orbit","Zoom"};
         char buf[128];
-        snprintf(buf, sizeof(buf), "ImageMaker M3 | Axis:%s Action:%s Obj:%s Brush:%s | scroll/+/−",
+        snprintf(buf, sizeof(buf), "ImageMaker M4 | Axis:%s Action:%s Obj:%s Brush:%s Decimate:%s | D/E/scroll/+/−",
             ax[selAxis], ac[selAction], selObject >= 0 ? "#0" : "none",
-            brushThickness > 0 ? "ADD" : "SUB");
+            brushThickness > 0 ? "ADD" : "SUB",
+            showDecimated ? "ON" : "OFF");
         glfwSetWindowTitle(window, buf);
     }
 
@@ -407,15 +417,103 @@ private:
         meshDirty = true;
     }
 
+    // ─── M4: Decimate toggle ──────────────────────────────────────────
+    void toggleDecimate() {
+        if (currentMeshVertices.empty()) return;
+
+        if (!showDecimated) {
+            // Decimate current mesh
+            decimated = MeshPostProcess::decimate(currentMeshVertices, meshIndices, 0.15f);
+            printf("Decimated: %u→%u triangles (%.1f%%)\n",
+                decimated.originalTris, decimated.reducedTris, decimated.reductionRatio * 100.0f);
+            if (decimated.vertices.empty()) {
+                printf("Decimation produced empty mesh, aborting\n");
+                return;
+            }
+        }
+        showDecimated = !showDecimated;
+        meshDirty = true; // triggers VBO rebuild with correct mesh
+        updateTitle();
+    }
+
+    // ─── M4: Export mesh as glTF ──────────────────────────────────────
+    void exportMesh() {
+        if (currentMeshVertices.empty()) return;
+
+        // Create exports dir if needed
+        std::string mkdirCmd = "mkdir -p " + exportDir;
+        if (system(mkdirCmd.c_str()) != 0) {
+            fprintf(stderr, "Warning: failed to create exports dir\n");
+        }
+
+        // Export original (high-poly)
+        std::string origPath = exportDir + "/imagemaker_original.glb";
+        GLTFExporter::exportOriginalGLB(origPath, currentMeshVertices, meshIndices);
+
+        // Decimate and export game-ready version
+        auto dec = MeshPostProcess::decimate(currentMeshVertices, meshIndices, 0.15f);
+        if (!dec.vertices.empty()) {
+            std::string gamePath = exportDir + "/imagemaker_game.glb";
+            GLTFExporter::exportGLB(gamePath, dec.vertices, dec.indices);
+
+            // Store for preview
+            decimated = dec;
+            showDecimated = true;
+            meshDirty = true;
+            updateTitle();
+            printf("Export complete: %s + %s\n", origPath.c_str(), gamePath.c_str());
+        } else {
+            printf("Decimation failed, exported original only\n");
+        }
+    }
+
     void updateMeshVBO() {
-        if (!meshDirty || currentMeshVertices.empty()) return;
-        VkDeviceSize vSize = sizeof(Vertex) * currentMeshVertices.size();
+        if (!meshDirty) return;
+
+        std::vector<Vertex> gpuVertices;
+        std::vector<uint32_t> gpuIndices;
+
+        if (showDecimated && !decimated.vertices.empty()) {
+            // Convert UVVertex → Vertex for GPU upload
+            gpuVertices.reserve(decimated.vertices.size());
+            for (auto& dv : decimated.vertices) {
+                Vertex v;
+                v.x = dv.x; v.y = dv.y; v.z = dv.z;
+                v.nx = dv.nx; v.ny = dv.ny; v.nz = dv.nz;
+                gpuVertices.push_back(v);
+            }
+            gpuIndices = decimated.indices;
+        } else if (!currentMeshVertices.empty()) {
+            gpuVertices = currentMeshVertices;
+            gpuIndices = meshIndices;
+        } else {
+            meshDirty = false;
+            return;
+        }
+
+        meshIdxCount = (uint32_t)gpuIndices.size();
+
+        VkDeviceSize vSize = sizeof(Vertex) * gpuVertices.size();
+        VkDeviceSize iSize = sizeof(uint32_t) * gpuIndices.size();
+
         vkDeviceWaitIdle(device);
         vkDestroyBuffer(device, vbo, nullptr);
         vkFreeMemory(device, vboMem, nullptr);
+        vkDestroyBuffer(device, ibo, nullptr);
+        vkFreeMemory(device, iboMem, nullptr);
+
         createBuffer(vSize, VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
             VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, vbo, vboMem);
-        copyToBuffer(vbo, currentMeshVertices.data(), vSize);
+        createBuffer(iSize, VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT,
+            VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, ibo, iboMem);
+        copyToBuffer(vbo, gpuVertices.data(), vSize);
+        copyToBuffer(ibo, gpuIndices.data(), iSize);
+
+        // Update CPU-side index copy if showing original (for ray tracing)
+        if (!showDecimated) {
+            // currentMeshVertices and meshIndices already reflect the live mesh
+        }
+
         meshDirty = false;
     }
 
@@ -1002,11 +1100,12 @@ private:
             auto now = glfwGetTime();
             if (now - lastTime >= 1.0) {
                 char buf[128];
-                snprintf(buf, sizeof(buf), "ImageMaker M3 | Axis:%s Action:%s Obj:%s Brush:%s | FPS:%d",
+                snprintf(buf, sizeof(buf), "ImageMaker M4 | Axis:%s Action:%s Obj:%s Brush:%s Decimate:%s | FPS:%d",
                     (const char*[]){"none","X","Y","Z"}[selAxis],
                     (const char*[]){"none","Rotate","Move","Orbit","Zoom"}[selAction],
                     selObject >= 0 ? "#0" : "none",
-                    brushThickness > 0 ? "ADD" : "SUB", frameCount);
+                    brushThickness > 0 ? "ADD" : "SUB",
+                    showDecimated ? "ON" : "OFF", frameCount);
                 glfwSetWindowTitle(window, buf);
                 frameCount = 0;
                 lastTime = now;
