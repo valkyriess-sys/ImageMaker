@@ -30,3 +30,15 @@ target_link_libraries(imagemaker PRIVATE
     glm::glm-header-only
     glfw
 )
+
+# M4: standalone export test (no Vulkan/GLFW — headless-friendly)
+add_executable(test_m4_export
+    tests/test_m4_export.cpp
+)
+target_include_directories(test_m4_export PRIVATE
+    ${Vulkan_INCLUDE_DIR}
+    src
+)
+target_link_libraries(test_m4_export PRIVATE
+    glm::glm-header-only
+)

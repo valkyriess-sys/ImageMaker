@@ -1,5 +1,5 @@
 #pragma once
-// ─── ImageMaker M4: glTF 2.0 Binary (.glb) Export ───────────────────
+// ─── ImageMaker M5: glTF 2.0 Binary (.glb) Export ───────────────────
 // Simple standalone writer — no external dependencies.
 // Binary glTF format: 12-byte header + JSON chunk + BIN chunk
 //
@@ -15,6 +15,7 @@
 //   <binary data>
 
 #include "mesh_postprocess.hpp"
+#include <glm/glm.hpp>
 #include <string>
 #include <vector>
 #include <cstring>
@@ -28,7 +29,8 @@ public:
     // ─── Export decimated mesh as .glb ────────────────────────────────
     static bool exportGLB(const std::string& path,
                            const std::vector<UVVertex>& vertices,
-                           const std::vector<uint32_t>& indices) {
+                           const std::vector<uint32_t>& indices,
+                           const glm::vec4& baseColor = glm::vec4(0.4f, 0.6f, 0.9f, 1.0f)) {
         if (vertices.empty() || indices.empty()) {
             fprintf(stderr, "glTF export: empty mesh\n");
             return false;
@@ -58,7 +60,7 @@ public:
 
         std::ostringstream json;
         json << "{";
-        json << "\"asset\":{\"version\":\"2.0\",\"generator\":\"ImageMaker M4\"},";
+        json << "\"asset\":{\"version\":\"2.0\",\"generator\":\"ImageMaker M5\"},";
         json << "\"scene\":0,";
         json << "\"scenes\":[{\"nodes\":[0]}],";
         json << "\"nodes\":[{\"mesh\":0}],";
@@ -69,10 +71,15 @@ public:
         json << "\"NORMAL\":1,";
         json << "\"TEXCOORD_0\":2";
         json << "},";
-        json << "\"indices\":3";
+        json << "\"indices\":3,";
+        json << "\"material\":0";
         json << "}],";
         json << "\"name\":\"ImageMaker_Mesh\"";
         json << "}],";
+        // M5: material with base color
+        json << "\"materials\":[{\"pbrMetallicRoughness\":{\"baseColorFactor\":["
+             << baseColor.r << "," << baseColor.g << "," << baseColor.b << "," << baseColor.a
+             << "]}}],";
         json << "\"accessors\":[";
 
         // POSITION accessor
@@ -184,7 +191,8 @@ public:
     // ─── Export original mesh (no UV) as .glb ────────────────────────
     static bool exportOriginalGLB(const std::string& path,
                                    const std::vector<Vertex>& vertices,
-                                   const std::vector<uint32_t>& indices) {
+                                   const std::vector<uint32_t>& indices,
+                                   const glm::vec4& baseColor = glm::vec4(0.4f, 0.6f, 0.9f, 1.0f)) {
         if (vertices.empty() || indices.empty()) {
             fprintf(stderr, "glTF export: empty mesh\n");
             return false;
@@ -210,7 +218,7 @@ public:
 
         std::ostringstream json;
         json << "{";
-        json << "\"asset\":{\"version\":\"2.0\",\"generator\":\"ImageMaker M4\"},";
+        json << "\"asset\":{\"version\":\"2.0\",\"generator\":\"ImageMaker M5\"},";
         json << "\"scene\":0,";
         json << "\"scenes\":[{\"nodes\":[0]}],";
         json << "\"nodes\":[{\"mesh\":0}],";
@@ -220,10 +228,15 @@ public:
         json << "\"POSITION\":0,";
         json << "\"NORMAL\":1";
         json << "},";
-        json << "\"indices\":2";
+        json << "\"indices\":2,";
+        json << "\"material\":0";
         json << "}],";
         json << "\"name\":\"ImageMaker_Original\"";
         json << "}],";
+        // M5: material with base color
+        json << "\"materials\":[{\"pbrMetallicRoughness\":{\"baseColorFactor\":["
+             << baseColor.r << "," << baseColor.g << "," << baseColor.b << "," << baseColor.a
+             << "]}}],";
         json << "\"accessors\":[";
 
         // Build min/max strings for POSITION

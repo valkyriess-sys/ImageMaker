@@ -34,7 +34,8 @@ public:
     // ═══════════════════════════════════════════════════════════════════
     // 1. DECIMATION — vertex clustering with centroid merging
     //    Reduces vertex count by merging vertices within a grid cell.
-    //    Preserves shape by using centroid of each cluster.
+    //    Uses iterative refinement to hit target ratio accurately,
+    //    accounting for surface vs. volumetric mesh topology.
     // ═══════════════════════════════════════════════════════════════════
     static DecimatedMesh decimate(const std::vector<Vertex>& verts,
                                    const std::vector<uint32_t>& indices,
@@ -54,78 +55,125 @@ public:
         float maxDim = std::max({bbSize.x, bbSize.y, bbSize.z});
         if (maxDim < 1e-6f) maxDim = 1.0f;
 
-        // Grid cell size: adjust to roughly hit target vertex count
-        // N_cells ≈ (bbSize / cell)^3, target ≈ original * targetRatio
-        float targetCells = (float)verts.size() * targetRatio;
-        float cellSize = maxDim / std::pow(targetCells, 1.0f / 3.0f);
-        cellSize = std::max(cellSize, maxDim * 0.01f); // clamp
+        // Iterative refinement: adjust cellSize to converge on target ratio.
+        // Single-pass cube-root formula assumes volume-filling; real meshes
+        // are surfaces needing larger cells for the same reduction.
+        float cellSize = maxDim * 0.25f;
+        float bestRatio = 1.0f;
+        std::vector<UVVertex> bestVerts;
+        std::vector<uint32_t> bestIndices;
 
-        // Quantize vertices to grid cells
-        struct CellKey {
-            int cx, cy, cz;
-            bool operator==(const CellKey& o) const { return cx==o.cx && cy==o.cy && cz==o.cz; }
-        };
-        struct CellKeyHash {
-            size_t operator()(const CellKey& k) const {
-                return ((size_t)k.cx * 73856093) ^ ((size_t)k.cy * 19349663) ^ ((size_t)k.cz * 83492791);
+        for (int iter = 0; iter < 4; iter++) {
+            // Quantize vertices to grid cells
+            struct CellKey {
+                int cx, cy, cz;
+                bool operator==(const CellKey& o) const { return cx==o.cx && cy==o.cy && cz==o.cz; }
+            };
+            struct CellKeyHash {
+                size_t operator()(const CellKey& k) const {
+                    return ((size_t)k.cx * 73856093) ^ ((size_t)k.cy * 19349663) ^ ((size_t)k.cz * 83492791);
+                }
+            };
+
+            std::unordered_map<CellKey, std::vector<uint32_t>, CellKeyHash> cellMap;
+            for (uint32_t i = 0; i < (uint32_t)verts.size(); i++) {
+                CellKey k;
+                k.cx = (int)std::floor((verts[i].x - bbMin.x) / cellSize);
+                k.cy = (int)std::floor((verts[i].y - bbMin.y) / cellSize);
+                k.cz = (int)std::floor((verts[i].z - bbMin.z) / cellSize);
+                cellMap[k].push_back(i);
             }
-        };
 
-        // Map: cell → list of vertex indices
-        std::unordered_map<CellKey, std::vector<uint32_t>, CellKeyHash> cellMap;
-        for (uint32_t i = 0; i < (uint32_t)verts.size(); i++) {
-            CellKey k;
-            k.cx = (int)std::floor((verts[i].x - bbMin.x) / cellSize);
-            k.cy = (int)std::floor((verts[i].y - bbMin.y) / cellSize);
-            k.cz = (int)std::floor((verts[i].z - bbMin.z) / cellSize);
-            cellMap[k].push_back(i);
-        }
+            // Build old→new vertex mapping + new vertices (centroids)
+            std::vector<uint32_t> oldToNew(verts.size(), UINT32_MAX);
+            std::vector<UVVertex> newVerts;
 
-        // Build old→new vertex mapping + new vertices (centroids)
-        std::vector<uint32_t> oldToNew(verts.size(), UINT32_MAX);
-        std::vector<UVVertex> newVerts;
+            for (auto& [cell, vtxIds] : cellMap) {
+                glm::vec3 centroid(0);
+                glm::vec3 avgNormal(0);
+                for (auto vi : vtxIds) {
+                    centroid += glm::vec3(verts[vi].x, verts[vi].y, verts[vi].z);
+                    avgNormal += glm::vec3(verts[vi].nx, verts[vi].ny, verts[vi].nz);
+                }
+                centroid /= (float)vtxIds.size();
+                avgNormal = glm::normalize(avgNormal);
 
-        for (auto& [cell, vtxIds] : cellMap) {
-            // Compute centroid
-            glm::vec3 centroid(0);
-            glm::vec3 avgNormal(0);
-            for (auto vi : vtxIds) {
-                centroid += glm::vec3(verts[vi].x, verts[vi].y, verts[vi].z);
-                avgNormal += glm::vec3(verts[vi].nx, verts[vi].ny, verts[vi].nz);
+                UVVertex nv;
+                nv.x = centroid.x; nv.y = centroid.y; nv.z = centroid.z;
+                nv.nx = avgNormal.x; nv.ny = avgNormal.y; nv.nz = avgNormal.z;
+                nv.u = 0; nv.v = 0;
+                uint32_t newIdx = (uint32_t)newVerts.size();
+                newVerts.push_back(nv);
+                for (auto vi : vtxIds) oldToNew[vi] = newIdx;
             }
-            centroid /= (float)vtxIds.size();
-            avgNormal = glm::normalize(avgNormal);
 
-            UVVertex nv;
-            nv.x = centroid.x; nv.y = centroid.y; nv.z = centroid.z;
-            nv.nx = avgNormal.x; nv.ny = avgNormal.y; nv.nz = avgNormal.z;
-            nv.u = 0; nv.v = 0;  // UV filled later
-            uint32_t newIdx = (uint32_t)newVerts.size();
-            newVerts.push_back(nv);
+            // Build new index buffer (skip degenerate triangles)
+            std::vector<uint32_t> newIndices;
+            for (size_t i = 0; i + 2 < indices.size(); i += 3) {
+                uint32_t a = oldToNew[indices[i]];
+                uint32_t b = oldToNew[indices[i+1]];
+                uint32_t c = oldToNew[indices[i+2]];
+                if (a == UINT32_MAX || b == UINT32_MAX || c == UINT32_MAX) continue;
+                if (a == b || b == c || a == c) continue;
+                newIndices.push_back(a);
+                newIndices.push_back(b);
+                newIndices.push_back(c);
+            }
 
-            for (auto vi : vtxIds) oldToNew[vi] = newIdx;
+            uint32_t reducedTris = (uint32_t)newIndices.size() / 3;
+            float achievedRatio = (float)reducedTris / (float)result.originalTris;
+
+            // Track best match
+            if (fabs(achievedRatio - targetRatio) < fabs(bestRatio - targetRatio)) {
+                bestRatio = achievedRatio;
+                bestVerts = std::move(newVerts);
+                bestIndices = std::move(newIndices);
+            }
+
+            // Within 3% tolerance → done
+            if (fabs(achievedRatio - targetRatio) < 0.03f) break;
+
+            // Adjust cellSize: if ratio too high (not enough reduction),
+            // cellSize is too small → increase it; vice versa.
+            float adjust = std::sqrt(achievedRatio / (targetRatio + 1e-6f));
+            adjust = std::max(0.5f, std::min(2.0f, adjust));
+            cellSize *= adjust;
+
+            cellSize = std::max(cellSize, maxDim * 0.005f);
+            cellSize = std::min(cellSize, maxDim * 5.0f);
         }
 
-        // Build new index buffer (skip degenerate triangles)
-        std::vector<uint32_t> newIndices;
-        for (size_t i = 0; i + 2 < indices.size(); i += 3) {
-            uint32_t a = oldToNew[indices[i]];
-            uint32_t b = oldToNew[indices[i+1]];
-            uint32_t c = oldToNew[indices[i+2]];
-            if (a == UINT32_MAX || b == UINT32_MAX || c == UINT32_MAX) continue;
-            if (a == b || b == c || a == c) continue; // degenerate
-            newIndices.push_back(a);
-            newIndices.push_back(b);
-            newIndices.push_back(c);
+        if (!bestVerts.empty()) {
+            generatePlanarUV(bestVerts, bestIndices);
+            result.vertices = std::move(bestVerts);
+            result.indices = std::move(bestIndices);
+            result.reducedTris = (uint32_t)result.indices.size() / 3;
+            result.reductionRatio = (float)result.reducedTris / (float)result.originalTris;
         }
 
-        // Generate UVs for the decimated mesh
-        generatePlanarUV(newVerts, newIndices);
-
-        result.vertices = std::move(newVerts);
-        result.indices = std::move(newIndices);
-        result.reducedTris = (uint32_t)result.indices.size() / 3;
-        result.reductionRatio = (float)result.reducedTris / (float)result.originalTris;
+        // Safety floor: very small meshes may collapse entirely.
+        // Return at least one valid triangle.
+        if (result.indices.size() < 3 && result.originalTris > 0) {
+            result.vertices.clear();
+            result.indices.clear();
+            for (size_t i = 0; i + 2 < indices.size(); i += 3) {
+                UVVertex v0, v1, v2;
+                v0.x = verts[indices[i]].x;   v0.y = verts[indices[i]].y;   v0.z = verts[indices[i]].z;
+                v0.nx = verts[indices[i]].nx; v0.ny = verts[indices[i]].ny; v0.nz = verts[indices[i]].nz;
+                v1.x = verts[indices[i+1]].x; v1.y = verts[indices[i+1]].y; v1.z = verts[indices[i+1]].z;
+                v1.nx = verts[indices[i+1]].nx; v1.ny = verts[indices[i+1]].ny; v1.nz = verts[indices[i+1]].nz;
+                v2.x = verts[indices[i+2]].x; v2.y = verts[indices[i+2]].y; v2.z = verts[indices[i+2]].z;
+                v2.nx = verts[indices[i+2]].nx; v2.ny = verts[indices[i+2]].ny; v2.nz = verts[indices[i+2]].nz;
+                v0.u = 0.0f; v0.v = 0.0f;
+                v1.u = 1.0f; v1.v = 0.0f;
+                v2.u = 0.5f; v2.v = 1.0f;
+                result.vertices = {v0, v1, v2};
+                result.indices = {0, 1, 2};
+                result.reducedTris = 1;
+                result.reductionRatio = 1.0f / (float)result.originalTris;
+                break;
+            }
+        }
         return result;
     }
 

@@ -20,12 +20,12 @@ int main() {
 
     // 2. Decimate
     printf("\n--- Decimation ---\n");
-    auto decSphere = MeshPostProcess::decimate(sphere.vertices, sphere.indices, 0.15f);
+    auto decSphere = MeshPostProcess::decimate(sphere.vertices, sphere.indices, 0.10f);
     printf("Sphere: %u→%u tris (%.1f%%)\n",
         decSphere.originalTris, decSphere.reducedTris, decSphere.reductionRatio * 100.0f);
     if (decSphere.vertices.empty()) { printf("FAIL: decimation produced empty mesh\n"); return 1; }
 
-    auto decBox = MeshPostProcess::decimate(box.vertices, box.indices, 0.15f);
+    auto decBox = MeshPostProcess::decimate(box.vertices, box.indices, 0.10f);
     printf("Box: %u→%u tris (%.1f%%)\n",
         decBox.originalTris, decBox.reducedTris, decBox.reductionRatio * 100.0f);
 
@@ -111,7 +111,7 @@ int main() {
     // 6. Summary
     printf("\n=== Validation Summary ===\n");
     printf("Mesh generation: PASS\n");
-    printf("Decimation:      PASS (vertex clustering, target 15%%)\n");
+    printf("Decimation:      PASS (vertex clustering, target 10%%)\n");
     printf("UV unwrap:       %s\n", hasUV ? "PASS (planar projection)" : "WARN");
     printf("glTF export:     PASS (binary .glb, valid structure)\n");
     printf("Files written to /tmp/imagemaker_test/\n");

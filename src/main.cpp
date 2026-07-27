@@ -61,7 +61,7 @@ static VkShaderModule createShaderModule(VkDevice dev, const std::vector<char>& 
 }
 
 // ─── Uniform Buffer Object ───────────────────────────────────────────
-struct UBO { glm::mat4 view, proj; };
+struct UBO { glm::mat4 view, proj; glm::vec4 camPos; };
 
 // ─── Push Constants ──────────────────────────────────────────────────
 struct PushConst { glm::mat4 model; glm::vec4 color; };
@@ -98,6 +98,7 @@ private:
     VkDescriptorSetLayout dsetLayout = VK_NULL_HANDLE;
     VkPipelineLayout pipeLayout = VK_NULL_HANDLE;
     VkPipeline meshPipe = VK_NULL_HANDLE, gridPipe = VK_NULL_HANDLE;
+    VkPipeline toonPipe = VK_NULL_HANDLE, outlinePipe = VK_NULL_HANDLE;
     std::vector<VkFramebuffer> framebuffers;
     VkCommandPool cmdPool = VK_NULL_HANDLE;
     // Depth
@@ -145,6 +146,11 @@ private:
     Axis selAxis = AXIS_NONE;
     Action selAction = ACT_NONE;
     int selObject = -1;  // -1: none, 0: first object
+
+    // M5: Toon shading + color state
+    bool toonMode = false;
+    int colorIdx = 0;
+    glm::vec4 meshColor = glm::vec4(0.4f, 0.6f, 0.9f, 1.0f);
 
     // Input state (track pressed keys no longer needed - using select pattern)
     // (keyPressed booleans removed — replaced by selectAxis/selectAction radio-toggle)
@@ -201,6 +207,8 @@ private:
             if (key == GLFW_KEY_B) { app->baseVertices = app->currentMeshVertices; }
             if (key == GLFW_KEY_D) { app->toggleDecimate(); }
             if (key == GLFW_KEY_E) { app->exportMesh(); }
+            if (key == GLFW_KEY_V) { app->toonMode = !app->toonMode; app->updateTitle(); }
+            if (key == GLFW_KEY_C) { app->nextColor(); app->updateTitle(); }
             if (key == GLFW_KEY_EQUAL || key == GLFW_KEY_KP_ADD) app->applyDelta(0.1f);
             if (key == GLFW_KEY_MINUS || key == GLFW_KEY_KP_SUBTRACT) app->applyDelta(-0.1f);
             if (key == GLFW_KEY_ESCAPE) glfwSetWindowShouldClose(w, true);
@@ -292,14 +300,33 @@ private:
     void updateTitle() {
         const char* ax[] = {"none","X","Y","Z"};
         const char* ac[] = {"none","Rotate","Move","Orbit","Zoom"};
-        char buf[128];
-        snprintf(buf, sizeof(buf), "ImageMaker M4 | Axis:%s Action:%s Obj:%s Brush:%s Decimate:%s | D/E/scroll/+/−",
+        char buf[192];
+        snprintf(buf, sizeof(buf),
+            "ImageMaker M5 | Axis:%s Action:%s Obj:%s Toon:%s Color:#%02x%02x%02x | V/C/D/E/scroll/+/-",
             ax[selAxis], ac[selAction], selObject >= 0 ? "#0" : "none",
-            brushThickness > 0 ? "ADD" : "SUB",
-            showDecimated ? "ON" : "OFF");
+            toonMode ? "ON" : "OFF",
+            (int)(meshColor.r*255) & 0xFF, (int)(meshColor.g*255) & 0xFF, (int)(meshColor.b*255) & 0xFF);
         glfwSetWindowTitle(window, buf);
     }
 
+
+
+    // M5: Color cycle helper
+    void nextColor() {
+        static const glm::vec4 presets[] = {
+            {0.4f, 0.6f, 0.9f, 1.0f}, // blue
+            {0.9f, 0.3f, 0.3f, 1.0f}, // red
+            {0.3f, 0.9f, 0.3f, 1.0f}, // green
+            {0.9f, 0.9f, 0.2f, 1.0f}, // yellow
+            {0.9f, 0.5f, 0.2f, 1.0f}, // orange
+            {0.7f, 0.3f, 0.9f, 1.0f}, // purple
+            {0.9f, 0.9f, 0.9f, 1.0f}, // white
+            {0.15f, 0.15f, 0.2f, 1.0f}, // dark
+        };
+        static const int N = sizeof(presets) / sizeof(presets[0]);
+        colorIdx = (colorIdx + 1) % N;
+        meshColor = presets[colorIdx];
+    }
     void applyDelta(float delta) {
         if (selAction == ACT_NONE) return;
         if (selAction == ACT_ZOOM || selAction == ACT_ORBIT) {
@@ -423,7 +450,7 @@ private:
 
         if (!showDecimated) {
             // Decimate current mesh
-            decimated = MeshPostProcess::decimate(currentMeshVertices, meshIndices, 0.15f);
+            decimated = MeshPostProcess::decimate(currentMeshVertices, meshIndices, 0.10f);
             printf("Decimated: %u→%u triangles (%.1f%%)\n",
                 decimated.originalTris, decimated.reducedTris, decimated.reductionRatio * 100.0f);
             if (decimated.vertices.empty()) {
@@ -446,15 +473,15 @@ private:
             fprintf(stderr, "Warning: failed to create exports dir\n");
         }
 
-        // Export original (high-poly)
+        // Export original (high-poly) with mesh color
         std::string origPath = exportDir + "/imagemaker_original.glb";
-        GLTFExporter::exportOriginalGLB(origPath, currentMeshVertices, meshIndices);
+        GLTFExporter::exportOriginalGLB(origPath, currentMeshVertices, meshIndices, meshColor);
 
-        // Decimate and export game-ready version
-        auto dec = MeshPostProcess::decimate(currentMeshVertices, meshIndices, 0.15f);
+        // Decimate and export game-ready version with mesh color
+        auto dec = MeshPostProcess::decimate(currentMeshVertices, meshIndices, 0.10f);
         if (!dec.vertices.empty()) {
             std::string gamePath = exportDir + "/imagemaker_game.glb";
-            GLTFExporter::exportGLB(gamePath, dec.vertices, dec.indices);
+            GLTFExporter::exportGLB(gamePath, dec.vertices, dec.indices, meshColor);
 
             // Store for preview
             decimated = dec;
@@ -755,7 +782,7 @@ private:
     void createDescriptorSetLayout() {
         VkDescriptorSetLayoutBinding bnd{};
         bnd.binding = 0; bnd.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
-        bnd.descriptorCount = 1; bnd.stageFlags = VK_SHADER_STAGE_VERTEX_BIT;
+        bnd.descriptorCount = 1; bnd.stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
         VkDescriptorSetLayoutCreateInfo ci{};
         ci.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
         ci.bindingCount = 1; ci.pBindings = &bnd;
@@ -765,11 +792,17 @@ private:
     void createPipelines() {
         auto meshVert = readFile("shaders/mesh.vert.spv");
         auto meshFrag = readFile("shaders/mesh.frag.spv");
+        auto toonFrag = readFile("shaders/toon.frag.spv");
+        auto outlineVert = readFile("shaders/outline.vert.spv");
+        auto outlineFrag = readFile("shaders/outline.frag.spv");
         auto gridVert = readFile("shaders/grid.vert.spv");
         auto gridFrag = readFile("shaders/grid.frag.spv");
 
         VkShaderModule mvs = createShaderModule(device, meshVert);
         VkShaderModule mfs = createShaderModule(device, meshFrag);
+        VkShaderModule tfs = createShaderModule(device, toonFrag);
+        VkShaderModule ovs = createShaderModule(device, outlineVert);
+        VkShaderModule ofs = createShaderModule(device, outlineFrag);
         VkShaderModule gvs = createShaderModule(device, gridVert);
         VkShaderModule gfs = createShaderModule(device, gridFrag);
 
@@ -783,8 +816,14 @@ private:
         plci.pushConstantRangeCount = 1; plci.pPushConstantRanges = &pcr;
         vkCreatePipelineLayout(device, &plci, nullptr, &pipeLayout);
 
-        // Build mesh pipeline
+        // Build mesh pipeline (Phong)
         meshPipe = createGraphicsPipeline(mvs, mfs, VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST,
+            sizeof(Vertex), offsetof(Vertex, x), offsetof(Vertex, nx));
+        // Build toon pipeline (cel shading + rim light)
+        toonPipe = createGraphicsPipeline(mvs, tfs, VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST,
+            sizeof(Vertex), offsetof(Vertex, x), offsetof(Vertex, nx));
+        // Build outline pipeline (inverted hull, backfaces only)
+        outlinePipe = createGraphicsPipeline(ovs, ofs, VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST,
             sizeof(Vertex), offsetof(Vertex, x), offsetof(Vertex, nx));
         // Build grid pipeline (for lines)
         gridPipe = createGraphicsPipeline(gvs, gfs, VK_PRIMITIVE_TOPOLOGY_LINE_LIST,
@@ -792,12 +831,16 @@ private:
 
         vkDestroyShaderModule(device, mvs, nullptr);
         vkDestroyShaderModule(device, mfs, nullptr);
+        vkDestroyShaderModule(device, tfs, nullptr);
+        vkDestroyShaderModule(device, ovs, nullptr);
+        vkDestroyShaderModule(device, ofs, nullptr);
         vkDestroyShaderModule(device, gvs, nullptr);
         vkDestroyShaderModule(device, gfs, nullptr);
     }
 
     VkPipeline createGraphicsPipeline(VkShaderModule vs, VkShaderModule fs,
-        VkPrimitiveTopology topo, uint32_t stride, uint32_t posOff, uint32_t normOff) {
+        VkPrimitiveTopology topo, uint32_t stride, uint32_t posOff, uint32_t normOff,
+        VkCullModeFlags cullMode = VK_CULL_MODE_NONE) {
         VkPipelineShaderStageCreateInfo ssi[2]{};
         ssi[0].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
         ssi[0].stage = VK_SHADER_STAGE_VERTEX_BIT; ssi[0].module = vs; ssi[0].pName = "main";
@@ -831,7 +874,7 @@ private:
         VkPipelineRasterizationStateCreateInfo rss{};
         rss.sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO;
         rss.lineWidth = 1.0f; rss.polygonMode = VK_POLYGON_MODE_FILL;
-        rss.cullMode = VK_CULL_MODE_NONE; rss.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
+        rss.cullMode = cullMode; rss.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
 
         VkPipelineMultisampleStateCreateInfo mss{};
         mss.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
@@ -1169,6 +1212,7 @@ private:
         float aspect = swapExtent.width / (float)swapExtent.height;
         ubo.proj = glm::perspective(glm::radians(45.0f / zoomLevel), aspect, 0.1f, 100.0f);
         ubo.proj[1][1] *= -1; // Vulkan Y flip
+        ubo.camPos = glm::vec4(eye + camTarget, 1.0f);
         memcpy(uboMapped[idx], &ubo, sizeof(UBO));
     }
 
@@ -1261,14 +1305,33 @@ private:
         }
 
         // ─── Draw mesh ────────────────────────────────────────────────
-        vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, meshPipe);
-        VkDeviceSize off = 0;
-        vkCmdBindVertexBuffers(cb, 0, 1, &vbo, &off);
-        vkCmdBindIndexBuffer(cb, ibo, 0, VK_INDEX_TYPE_UINT32);
         glm::mat4 model = glm::translate(glm::mat4(1.0f), modelPos) * glm::mat4_cast(modelRot);
         PushConst mpc{};
         mpc.model = model;
-        mpc.color = (selObject >= 0) ? glm::vec4(1.0f, 0.8f, 0.2f, 1.0f) : glm::vec4(0.4f, 0.6f, 0.9f, 1.0f);
+        mpc.color = (selObject >= 0) ? meshColor : glm::vec4(0.4f, 0.6f, 0.9f, 1.0f);
+
+        if (toonMode) {
+            // Draw outline first (inverted hull)
+            vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, outlinePipe);
+            VkDeviceSize off2 = 0;
+            vkCmdBindVertexBuffers(cb, 0, 1, &vbo, &off2);
+            vkCmdBindIndexBuffer(cb, ibo, 0, VK_INDEX_TYPE_UINT32);
+            PushConst opc{};
+            opc.model = model;
+            opc.color = glm::vec4(0.0f, 0.0f, 0.0f, 1.0f);
+            vkCmdPushConstants(cb, pipeLayout, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
+                0, sizeof(PushConst), &opc);
+            vkCmdDrawIndexed(cb, meshIdxCount, 1, 0, 0, 0);
+
+            // Draw toon-shaded mesh on top
+            vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, toonPipe);
+        } else {
+            vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, meshPipe);
+        }
+
+        VkDeviceSize off = 0;
+        vkCmdBindVertexBuffers(cb, 0, 1, &vbo, &off);
+        vkCmdBindIndexBuffer(cb, ibo, 0, VK_INDEX_TYPE_UINT32);
         vkCmdPushConstants(cb, pipeLayout, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
             0, sizeof(PushConst), &mpc);
         vkCmdDrawIndexed(cb, meshIdxCount, 1, 0, 0, 0);
@@ -1311,6 +1374,8 @@ private:
         vkFreeMemory(device, depthMem, nullptr);
         for (auto fb : framebuffers) vkDestroyFramebuffer(device, fb, nullptr);
         vkDestroyPipeline(device, meshPipe, nullptr);
+        vkDestroyPipeline(device, toonPipe, nullptr);
+        vkDestroyPipeline(device, outlinePipe, nullptr);
         vkDestroyPipeline(device, gridPipe, nullptr);
         vkDestroyPipelineLayout(device, pipeLayout, nullptr);
         vkDestroyRenderPass(device, renderPass, nullptr);
