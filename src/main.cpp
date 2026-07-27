@@ -159,11 +159,19 @@ private:
     uint32_t strokeIdxCount = 0;
     bool strokeDirty = false; // need to update GPU buffers
 
+    // M3: Sculpt state
+    std::vector<Vertex> baseVertices;  // original mesh for undo (per-frame update on change)
+    std::vector<glm::vec3> sculptHits; // surface hit points during stroke
+    bool meshDirty = false;            // need to update mesh VBO
+    float brushThickness = 0.15f;      // U key toggles add/subtract, thickness from stroke spread
+    std::vector<Vertex> currentMeshVertices; // live mesh data (mutated by sculpt)
+    std::vector<uint32_t> meshIndices;       // CPU copy of index buffer for ray tracing
+
     // ─── Window ──────────────────────────────────────────────────────
     void initWindow() {
         glfwInit();
         glfwWindowHint(GLFW_CLIENT_API, GLFW_NO_API);
-        window = glfwCreateWindow(WIDTH, HEIGHT, "ImageMaker M2 | Axis:none Action:none | scroll/+-", nullptr, nullptr);
+        window = glfwCreateWindow(WIDTH, HEIGHT, "ImageMaker M3 | Axis:none Action:none Brush:ADD | scroll/+/−", nullptr, nullptr);
         if (!window) { std::cerr << "Failed to create GLFW window (no display?)\n"; glfwTerminate(); exit(1); }
         glfwSetWindowUserPointer(window, this);
         glfwSetKeyCallback(window, keyCB);
@@ -182,6 +190,8 @@ private:
             if (key == GLFW_KEY_M) { app->selectAction(ACT_MOVE); }
             if (key == GLFW_KEY_S) { app->selectAction(ACT_ORBIT); }
             if (key == GLFW_KEY_T) { app->selectAction(ACT_ZOOM); }
+            if (key == GLFW_KEY_U) { app->brushThickness = -app->brushThickness; }
+            if (key == GLFW_KEY_B) { app->baseVertices = app->currentMeshVertices; }
             if (key == GLFW_KEY_EQUAL || key == GLFW_KEY_KP_ADD) app->applyDelta(0.1f);
             if (key == GLFW_KEY_MINUS || key == GLFW_KEY_KP_SUBTRACT) app->applyDelta(-0.1f);
             if (key == GLFW_KEY_ESCAPE) glfwSetWindowShouldClose(w, true);
@@ -206,6 +216,11 @@ private:
                 glfwGetCursorPos(w, &app->lastMouseX, &app->lastMouseY);
                 app->leftDragging = true;
             } else if (action == GLFW_RELEASE) {
+                // M3: Apply sculpt displacement on stroke end
+                if (!app->sculptHits.empty()) {
+                    app->sculptDisplace(app->sculptHits);
+                    app->sculptHits.clear();
+                }
                 app->leftDragging = false;
             }
         } else if (btn == GLFW_MOUSE_BUTTON_RIGHT && action == GLFW_PRESS) {
@@ -240,6 +255,15 @@ private:
         app->strokeIdxs.push_back(base + 1);
         app->strokeDirty = true;
 
+        // M3: Also trace ray against mesh for sculpt
+        if (app->selObject >= 0) {
+            auto ray = app->screenToRay((float)x, (float)y);
+            glm::vec3 hitPt;
+            if (app->rayMeshHit(ray, hitPt)) {
+                app->sculptHits.push_back(hitPt);
+            }
+        }
+
         app->lastMouseX = x;
         app->lastMouseY = y;
     }
@@ -260,8 +284,9 @@ private:
         const char* ax[] = {"none","X","Y","Z"};
         const char* ac[] = {"none","Rotate","Move","Orbit","Zoom"};
         char buf[128];
-        snprintf(buf, sizeof(buf), "ImageMaker M2 | Axis:%s Action:%s Obj:%s | scroll/+/-",
-            ax[selAxis], ac[selAction], selObject >= 0 ? "#0" : "none");
+        snprintf(buf, sizeof(buf), "ImageMaker M3 | Axis:%s Action:%s Obj:%s Brush:%s | scroll/+/−",
+            ax[selAxis], ac[selAction], selObject >= 0 ? "#0" : "none",
+            brushThickness > 0 ? "ADD" : "SUB");
         glfwSetWindowTitle(window, buf);
     }
 
@@ -286,6 +311,112 @@ private:
                 modelPos += euler * 0.5f;
             }
         }
+    }
+
+    // ─── M3: Sculpt helpers ───────────────────────────────────────────
+    glm::mat4 currentViewProj() const {
+        float cx = camDist * sin(camPhi) * cos(camTheta);
+        float cy = camDist * cos(camPhi);
+        float cz = camDist * sin(camPhi) * sin(camTheta);
+        glm::vec3 eye(cx, cy, cz);
+        glm::vec3 up(0, 1, 0);
+        glm::mat4 view = glm::lookAt(eye + camTarget, camTarget, up);
+        float aspect = swapExtent.width / (float)swapExtent.height;
+        glm::mat4 proj = glm::perspective(glm::radians(45.0f / zoomLevel), aspect, 0.1f, 100.0f);
+        proj[1][1] *= -1;
+        return proj * view;
+    }
+
+    struct Ray { glm::vec3 origin, dir; };
+
+    Ray screenToRay(float sx, float sy) const {
+        float ndcX = (sx / WIDTH) * 2.0f - 1.0f;
+        float ndcY = -((sy / HEIGHT) * 2.0f - 1.0f);
+        glm::mat4 invPV = glm::inverse(currentViewProj());
+        glm::vec4 nearP = invPV * glm::vec4(ndcX, ndcY, 0.0f, 1.0f);
+        nearP /= nearP.w;
+        glm::vec4 farP = invPV * glm::vec4(ndcX, ndcY, 1.0f, 1.0f);
+        farP /= farP.w;
+        return {glm::vec3(nearP), glm::normalize(glm::vec3(farP) - glm::vec3(nearP))};
+    }
+
+    bool rayTri(const glm::vec3& ro, const glm::vec3& rd,
+                const glm::vec3& v0, const glm::vec3& v1, const glm::vec3& v2,
+                float& t, float maxDist = 1.5f) const {
+        glm::vec3 e1 = v1 - v0, e2 = v2 - v0;
+        glm::vec3 p = glm::cross(rd, e2);
+        float det = glm::dot(e1, p);
+        if (fabs(det) < 1e-7f) return false;
+        float invDet = 1.0f / det;
+        glm::vec3 tv = ro - v0;
+        float u = glm::dot(tv, p) * invDet;
+        if (u < 0 || u > 1) return false;
+        glm::vec3 q = glm::cross(tv, e1);
+        float v = glm::dot(rd, q) * invDet;
+        if (v < 0 || u + v > 1) return false;
+        t = glm::dot(e2, q) * invDet;
+        return t > 0.001f && t < maxDist;
+    }
+
+    bool rayMeshHit(const Ray& ray, glm::vec3& hitPoint) const {
+        if (currentMeshVertices.empty() || meshIndices.empty()) return false;
+        glm::mat4 model = glm::translate(glm::mat4(1.0f), modelPos) * glm::mat4_cast(modelRot);
+        float bestT = 1e9f;
+        bool hit = false;
+        for (size_t i = 0; i + 2 < meshIndices.size(); i += 3) {
+            const auto& v0 = currentMeshVertices[meshIndices[i]];
+            const auto& v1 = currentMeshVertices[meshIndices[i+1]];
+            const auto& v2 = currentMeshVertices[meshIndices[i+2]];
+            // Transform to world space
+            glm::vec3 wv0 = glm::vec3(model * glm::vec4(v0.x, v0.y, v0.z, 1.0f));
+            glm::vec3 wv1 = glm::vec3(model * glm::vec4(v1.x, v1.y, v1.z, 1.0f));
+            glm::vec3 wv2 = glm::vec3(model * glm::vec4(v2.x, v2.y, v2.z, 1.0f));
+            float t;
+            if (rayTri(ray.origin, ray.dir, wv0, wv1, wv2, t) && t < bestT) {
+                bestT = t;
+                hitPoint = ray.origin + ray.dir * t;
+                hit = true;
+            }
+        }
+        return hit;
+    }
+
+    void sculptDisplace(const std::vector<glm::vec3>& hits) {
+        if (hits.empty() || currentMeshVertices.empty()) return;
+        glm::mat4 invModel = glm::inverse(
+            glm::translate(glm::mat4(1.0f), modelPos) * glm::mat4_cast(modelRot));
+        float strength = fabs(brushThickness);
+        int sign = (brushThickness > 0) ? 1 : -1;
+
+        for (auto& v : currentMeshVertices) {
+            glm::vec3 modelP(v.x, v.y, v.z);
+            float minDist = 1e9f;
+            for (auto& h : hits) {
+                glm::vec3 localH = glm::vec3(invModel * glm::vec4(h, 1.0f));
+                float d = glm::distance(modelP, localH);
+                if (d < minDist) minDist = d;
+            }
+            if (minDist < strength * 2.0f) {
+                float falloff = 1.0f - (minDist / (strength * 2.0f));
+                falloff = falloff * falloff;
+                v.x += v.nx * strength * falloff * sign;
+                v.y += v.ny * strength * falloff * sign;
+                v.z += v.nz * strength * falloff * sign;
+            }
+        }
+        meshDirty = true;
+    }
+
+    void updateMeshVBO() {
+        if (!meshDirty || currentMeshVertices.empty()) return;
+        VkDeviceSize vSize = sizeof(Vertex) * currentMeshVertices.size();
+        vkDeviceWaitIdle(device);
+        vkDestroyBuffer(device, vbo, nullptr);
+        vkFreeMemory(device, vboMem, nullptr);
+        createBuffer(vSize, VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
+            VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, vbo, vboMem);
+        copyToBuffer(vbo, currentMeshVertices.data(), vSize);
+        meshDirty = false;
     }
 
     // ─── Vulkan Init ─────────────────────────────────────────────────
@@ -718,6 +849,9 @@ private:
         // Generate test mesh (sphere)
         Mesh m = PrimitiveGenerator::generateIcoSphere(1.0f, 3);
         meshIdxCount = (uint32_t)m.indices.size();
+        baseVertices = m.vertices;
+        currentMeshVertices = m.vertices;
+        meshIndices = m.indices;
         VkDeviceSize vSize = sizeof(Vertex) * m.vertices.size();
         VkDeviceSize iSize = sizeof(uint32_t) * m.indices.size();
         createBuffer(vSize, VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
@@ -868,10 +1002,11 @@ private:
             auto now = glfwGetTime();
             if (now - lastTime >= 1.0) {
                 char buf[128];
-                snprintf(buf, sizeof(buf), "ImageMaker M2 | Axis:%s Action:%s Obj:%s | FPS:%d",
+                snprintf(buf, sizeof(buf), "ImageMaker M3 | Axis:%s Action:%s Obj:%s Brush:%s | FPS:%d",
                     (const char*[]){"none","X","Y","Z"}[selAxis],
                     (const char*[]){"none","Rotate","Move","Orbit","Zoom"}[selAction],
-                    selObject >= 0 ? "#0" : "none", frameCount);
+                    selObject >= 0 ? "#0" : "none",
+                    brushThickness > 0 ? "ADD" : "SUB", frameCount);
                 glfwSetWindowTitle(window, buf);
                 frameCount = 0;
                 lastTime = now;
@@ -892,6 +1027,10 @@ private:
         if (strokeDirty) {
             updateStrokeBuffers();
             strokeDirty = false;
+        }
+        // Update mesh VBO if sculpted
+        if (meshDirty) {
+            updateMeshVBO();
         }
 
         // Update UBO
