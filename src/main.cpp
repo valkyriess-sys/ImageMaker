@@ -147,6 +147,11 @@ private:
     Action selAction = ACT_NONE;
     int selObject = -1;  // -1: none, 0: first object
 
+    // M6: Stroke-to-mesh tube mode
+    bool strokeMode = false;            // L key toggle: stroke→tube vs sculpt
+    float tubeRadius = 0.15f;           // tube cross-section radius
+    std::vector<Point2D> strokePath2D;  // raw 2D path collected during drag
+
     // M5: Toon shading + color state
     bool toonMode = false;
     int colorIdx = 0;
@@ -184,7 +189,7 @@ private:
     void initWindow() {
         glfwInit();
         glfwWindowHint(GLFW_CLIENT_API, GLFW_NO_API);
-        window = glfwCreateWindow(WIDTH, HEIGHT, "ImageMaker M3 | Axis:none Action:none Brush:ADD | scroll/+/−", nullptr, nullptr);
+        window = glfwCreateWindow(WIDTH, HEIGHT, "ImageMaker M6 | Axis:none Action:none Mode:SCULPT | L/scroll/+/−", nullptr, nullptr);
         if (!window) { std::cerr << "Failed to create GLFW window (no display?)\n"; glfwTerminate(); exit(1); }
         glfwSetWindowUserPointer(window, this);
         glfwSetKeyCallback(window, keyCB);
@@ -442,6 +447,216 @@ private:
             }
         }
         meshDirty = true;
+    }
+
+    // ─── M6: Stroke → Tube Mesh ──────────────────────────────────────
+
+    // Project a 2D screen point to 3D world space.
+    // Places the point on a plane through camTarget, perpendicular to view direction.
+    glm::vec3 projectToWorld(float sx, float sy) const {
+        Ray ray = screenToRay(sx, sy);
+        // Compute view direction
+        float cx = camDist * sin(camPhi) * cos(camTheta);
+        float cy = camDist * cos(camPhi);
+        float cz = camDist * sin(camPhi) * sin(camTheta);
+        glm::vec3 eye(cx, cy, cz);
+        glm::vec3 viewDir = glm::normalize(camTarget - eye);
+        // Ray-plane intersection: plane through camTarget with normal = viewDir
+        float denom = glm::dot(ray.dir, viewDir);
+        if (fabs(denom) < 1e-6f) return camTarget;
+        float t = glm::dot(camTarget - ray.origin, viewDir) / denom;
+        return ray.origin + ray.dir * t;
+    }
+
+    // Generate a tube mesh from a sequence of 3D world-space points.
+    // Uses Catmull-Rom spline resampling, Frenet frames, and circular cross-sections.
+    Mesh generateTubeMesh(const std::vector<glm::vec3>& path, float radius, int radialSegs = 16) {
+        Mesh result;
+        if (path.size() < 2) return result;
+
+        // --- Detect closed curve ---
+        bool closed = false;
+        std::vector<glm::vec3> pts = path;
+        if (pts.size() >= 3 && glm::distance(pts.front(), pts.back()) < radius * 2.0f) {
+            closed = true;
+        }
+
+        // --- Catmull-Rom spline resampling ---
+        auto catmullRom = [](const glm::vec3& p0, const glm::vec3& p1,
+                              const glm::vec3& p2, const glm::vec3& p3, float t) -> glm::vec3 {
+            float t2 = t * t, t3 = t2 * t;
+            return 0.5f * ((2.0f * p1) +
+                           (-p0 + p2) * t +
+                           (2.0f * p0 - 5.0f * p1 + 4.0f * p2 - p3) * t2 +
+                           (-p0 + 3.0f * p1 - 3.0f * p2 + p3) * t3);
+        };
+
+        int n = (int)pts.size();
+        int resampleCount = closed ? 64 : std::min(64, n * 4);
+        std::vector<glm::vec3> spline(resampleCount);
+
+        for (int i = 0; i < resampleCount; i++) {
+            float t = (float)i / (float)(resampleCount - (closed ? 0 : 1));
+            float globalT = t * (float)(closed ? n : n - 1);
+            int seg = (int)glm::clamp(globalT, 0.0f, (float)(closed ? n - 1 : n - 2));
+            float localT = globalT - (float)seg;
+
+            int i0 = seg - 1, i1 = seg, i2 = seg + 1, i3 = seg + 2;
+            if (closed) {
+                i0 = (i0 + n) % n;
+                i1 = i1 % n;
+                i2 = i2 % n;
+                i3 = i3 % n;
+            } else {
+                i0 = std::max(0, i0);
+                i2 = std::min(n - 1, i2);
+                i3 = std::min(n - 1, i3);
+            }
+            spline[i] = catmullRom(pts[i0], pts[i1], pts[i2], pts[i3], localT);
+        }
+
+        // --- Frenet frames + ring generation ---
+        struct Frame { glm::vec3 N, B; };
+        std::vector<glm::vec3> tangents(resampleCount);
+        std::vector<Frame> frames(resampleCount);
+
+        for (int i = 0; i < resampleCount; i++) {
+            int next = (i + 1) % resampleCount;
+            int prev = (i - 1 + resampleCount) % resampleCount;
+            if (!closed && i == 0) prev = 0;
+            if (!closed && i == resampleCount - 1) next = i;
+
+            tangents[i] = glm::normalize(spline[next] - spline[prev]);
+            if (glm::length(tangents[i]) < 1e-6f) {
+                tangents[i] = glm::vec3(0, 1, 0);
+            }
+        }
+
+        // First frame: pick arbitrary normal, then orthogonalize
+        glm::vec3 up(0, 1, 0);
+        if (fabs(glm::dot(tangents[0], up)) > 0.99f) up = glm::vec3(1, 0, 0);
+        frames[0].N = glm::normalize(glm::cross(tangents[0], up));
+        frames[0].B = glm::normalize(glm::cross(tangents[0], frames[0].N));
+
+        // Propagate frames along curve (parallel transport / rotation minimization)
+        for (int i = 1; i < resampleCount; i++) {
+            glm::vec3 prevT = tangents[i-1];
+            glm::vec3 curT = tangents[i];
+            glm::vec3 prevN = frames[i-1].N;
+            glm::vec3 prevB = frames[i-1].B;
+
+            // Rotate previous frame to align with current tangent
+            glm::vec3 axis = glm::cross(prevT, curT);
+            float angle = acos(glm::clamp(glm::dot(prevT, curT), -1.0f, 1.0f));
+            if (glm::length(axis) < 1e-6f) {
+                // Parallel tangents, just copy
+                frames[i].N = prevN;
+                frames[i].B = prevB;
+            } else {
+                axis = glm::normalize(axis);
+                glm::quat rot = glm::angleAxis(angle, axis);
+                frames[i].N = glm::normalize(rot * prevN);
+                frames[i].B = glm::normalize(rot * prevB);
+            }
+        }
+
+        // --- Generate vertices (circular rings) ---
+        for (int i = 0; i < resampleCount; i++) {
+            for (int j = 0; j < radialSegs; j++) {
+                float theta = 2.0f * M_PI * j / radialSegs;
+                float ct = cos(theta), st = sin(theta);
+                glm::vec3 normal = ct * frames[i].N + st * frames[i].B;
+                glm::vec3 pos = spline[i] + normal * radius;
+
+                Vertex v;
+                v.x = pos.x; v.y = pos.y; v.z = pos.z;
+                v.nx = normal.x; v.ny = normal.y; v.nz = normal.z;
+                result.vertices.push_back(v);
+            }
+        }
+
+        // --- Connect rings with triangles ---
+        for (int i = 0; i < resampleCount; i++) {
+            int nextRing = (i + 1) % resampleCount;
+            if (!closed && i == resampleCount - 1) continue; // last ring: no next
+
+            for (int j = 0; j < radialSegs; j++) {
+                int a = i * radialSegs + j;
+                int b = i * radialSegs + (j + 1) % radialSegs;
+                int c = nextRing * radialSegs + j;
+                int d = nextRing * radialSegs + (j + 1) % radialSegs;
+
+                result.indices.push_back(a);
+                result.indices.push_back(c);
+                result.indices.push_back(b);
+
+                result.indices.push_back(b);
+                result.indices.push_back(c);
+                result.indices.push_back(d);
+            }
+        }
+
+        // --- End caps (for open curves) ---
+        if (!closed) {
+            auto addCap = [&](int ringIdx, bool isStart) {
+                int centerIdx = (int)result.vertices.size();
+                glm::vec3 center = spline[ringIdx];
+                Vertex cv;
+                cv.x = center.x; cv.y = center.y; cv.z = center.z;
+                // Cap normal points along the tangent direction (outward)
+                glm::vec3 capN = isStart ? -tangents[ringIdx] : tangents[ringIdx];
+                cv.nx = capN.x; cv.ny = capN.y; cv.nz = capN.z;
+                result.vertices.push_back(cv);
+
+                for (int j = 0; j < radialSegs; j++) {
+                    int a = ringIdx * radialSegs + j;
+                    int b = ringIdx * radialSegs + (j + 1) % radialSegs;
+                    if (isStart) {
+                        result.indices.push_back(centerIdx);
+                        result.indices.push_back(b);
+                        result.indices.push_back(a);
+                    } else {
+                        result.indices.push_back(centerIdx);
+                        result.indices.push_back(a);
+                        result.indices.push_back(b);
+                    }
+                }
+            };
+            addCap(0, true);                          // start cap
+            addCap(resampleCount - 1, false);         // end cap
+        }
+
+        return result;
+    }
+
+    // Convert collected 2D stroke path to 3D tube mesh and replace the current mesh.
+    void generateTubeFromStroke() {
+        if (strokePath2D.size() < 2) return;
+
+        // Project 2D screen points to 3D world space
+        std::vector<glm::vec3> worldPath;
+        worldPath.reserve(strokePath2D.size());
+        for (auto& p : strokePath2D) {
+            worldPath.push_back(projectToWorld(p.x, p.y));
+        }
+
+        // Generate tube mesh
+        Mesh tube = generateTubeMesh(worldPath, tubeRadius, 16);
+        if (tube.vertices.empty()) return;
+
+        // Replace current mesh with tube
+        currentMeshVertices = tube.vertices;
+        meshIndices = tube.indices;
+        baseVertices = tube.vertices;  // reset sculpt baseline
+        meshIdxCount = (uint32_t)tube.indices.size();
+        meshDirty = true;
+        selObject = 0;  // auto-select the new tube
+
+        printf("Tube: %zu vertices, %zu triangles, %zu path points\n",
+               tube.vertices.size(), tube.indices.size() / 3, strokePath2D.size());
+
+        // Clear the 2D path for next stroke
+        strokePath2D.clear();
     }
 
     // ─── M4: Decimate toggle ──────────────────────────────────────────
@@ -1143,7 +1358,7 @@ private:
             auto now = glfwGetTime();
             if (now - lastTime >= 1.0) {
                 char buf[128];
-                snprintf(buf, sizeof(buf), "ImageMaker M4 | Axis:%s Action:%s Obj:%s Brush:%s Decimate:%s | FPS:%d",
+                snprintf(buf, sizeof(buf), "ImageMaker M6 | Axis:%s Action:%s Obj:%s Brush:%s Decimate:%s | FPS:%d",
                     (const char*[]){"none","X","Y","Z"}[selAxis],
                     (const char*[]){"none","Rotate","Move","Orbit","Zoom"}[selAction],
                     selObject >= 0 ? "#0" : "none",
