@@ -1,0 +1,29 @@
+# Build artifacts
+build/
+cmake-build-*/
+*.o
+*.obj
+*.bin
+
+# vcpkg (submodule or installed)
+vcpkg/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Local config / secrets
+*.ini
+.env
+secrets/
+
+# Kanban workspaces (local only)
+.kanban/
+
+# Logs
+*.log
