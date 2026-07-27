@@ -152,10 +152,16 @@ private:
     float tubeRadius = 0.15f;           // tube cross-section radius
     std::vector<Point2D> strokePath2D;  // raw 2D path collected during drag
 
-    // M5: Toon shading + color state
+    // M5: Toon shading
     bool toonMode = false;
-    int colorIdx = 0;
+
+    // Color palette (Adobe-style overlay)
+    bool paletteOpen = false;
     glm::vec4 meshColor = glm::vec4(0.4f, 0.6f, 0.9f, 1.0f);
+    VkBuffer paletteVbo = VK_NULL_HANDLE, paletteIbo = VK_NULL_HANDLE;
+    VkDeviceMemory paletteVboMem = VK_NULL_HANDLE, paletteIboMem = VK_NULL_HANDLE;
+    uint32_t paletteIdxCount = 0;
+    bool paletteDirty = true;  // rebuild palette geometry on first open
 
     // Input state (track pressed keys no longer needed - using select pattern)
     // (keyPressed booleans removed — replaced by selectAxis/selectAction radio-toggle)
@@ -213,7 +219,7 @@ private:
             if (key == GLFW_KEY_D) { app->toggleDecimate(); }
             if (key == GLFW_KEY_E) { app->exportMesh(); }
             if (key == GLFW_KEY_V) { app->toonMode = !app->toonMode; app->updateTitle(); }
-            if (key == GLFW_KEY_C) { app->nextColor(); app->updateTitle(); }
+            if (key == GLFW_KEY_C) { app->paletteOpen = !app->paletteOpen; app->updateTitle(); }
             if (key == GLFW_KEY_EQUAL || key == GLFW_KEY_KP_ADD) app->applyDelta(0.1f);
             if (key == GLFW_KEY_MINUS || key == GLFW_KEY_KP_SUBTRACT) app->applyDelta(-0.1f);
             if (key == GLFW_KEY_ESCAPE) glfwSetWindowShouldClose(w, true);
@@ -227,6 +233,8 @@ private:
         auto* app = (VulkanApp*)glfwGetWindowUserPointer(w);
         if (btn == GLFW_MOUSE_BUTTON_LEFT) {
             if (action == GLFW_PRESS) {
+                // Check palette hit first
+                if (app->paletteOpen && app->tryPickPalette(w)) return;
                 double now = glfwGetTime();
                 if (now - app->lastClickTime < DOUBLE_CLICK_THRESH) {
                     // Double-click: toggle object selection
@@ -317,20 +325,96 @@ private:
 
 
     // M5: Color cycle helper
-    void nextColor() {
-        static const glm::vec4 presets[] = {
-            {0.4f, 0.6f, 0.9f, 1.0f}, // blue
-            {0.9f, 0.3f, 0.3f, 1.0f}, // red
-            {0.3f, 0.9f, 0.3f, 1.0f}, // green
-            {0.9f, 0.9f, 0.2f, 1.0f}, // yellow
-            {0.9f, 0.5f, 0.2f, 1.0f}, // orange
-            {0.7f, 0.3f, 0.9f, 1.0f}, // purple
-            {0.9f, 0.9f, 0.9f, 1.0f}, // white
-            {0.15f, 0.15f, 0.2f, 1.0f}, // dark
-        };
-        static const int N = sizeof(presets) / sizeof(presets[0]);
-        colorIdx = (colorIdx + 1) % N;
-        meshColor = presets[colorIdx];
+    // ─── Color Palette ─────────────────────────────────────────────────
+    static constexpr int PALETTE_COLS = 8, PALETTE_ROWS = 4;
+    static constexpr int PALETTE_CELLS = PALETTE_COLS * PALETTE_ROWS;
+
+    // Adobe-style palette: rows by hue, columns by tint
+    static glm::vec3 adobeColors(int row, int col) {
+        float t = col / (float)(PALETTE_COLS - 1);
+        switch (row) {
+            case 0: // Red → Orange
+                return {0.9f, 0.15f + t * 0.5f, 0.1f + t * 0.2f};
+            case 1: // Yellow → Green
+                return {0.2f + t * 0.5f * (1 - t), 0.85f, 0.15f + t * 0.3f};
+            case 2: // Cyan → Blue
+                return {0.1f + t * 0.1f, 0.4f + t * 0.4f, 0.9f - t * 0.3f};
+            case 3: // Purple → Magenta
+                return {0.5f + t * 0.4f, 0.1f + t * 0.1f, 0.8f - t * 0.3f};
+            default: return {0.5f, 0.5f, 0.5f};
+        }
+    }
+
+    void buildPalette() {
+        // Destroy old buffers
+        if (paletteVbo != VK_NULL_HANDLE) {
+            vkDestroyBuffer(device, paletteVbo, nullptr);
+            vkFreeMemory(device, paletteVboMem, nullptr);
+            vkDestroyBuffer(device, paletteIbo, nullptr);
+            vkFreeMemory(device, paletteIboMem, nullptr);
+        }
+
+        float cellW = 0.06f, cellH = 0.08f;  // NDC size
+        float gap = 0.005f;
+        float startX = -0.95f, startY = 0.80f; // top-left corner
+
+        std::vector<GVertex> verts;
+        std::vector<uint32_t> idxs;
+
+        for (int r = 0; r < PALETTE_ROWS; r++) {
+            for (int c = 0; c < PALETTE_COLS; c++) {
+                float x = startX + c * (cellW + gap);
+                float y = startY - r * (cellH + gap);
+                glm::vec3 rgb = adobeColors(r, c);
+                glm::vec4 col(rgb.r, rgb.g, rgb.b, 1.0f);
+                uint32_t base = (uint32_t)verts.size();
+                verts.push_back({{x, y + cellH, 0}, col});       // top-left
+                verts.push_back({{x + cellW, y + cellH, 0}, col}); // top-right
+                verts.push_back({{x + cellW, y, 0}, col});        // bottom-right
+                verts.push_back({{x, y, 0}, col});               // bottom-left
+                idxs.push_back(base); idxs.push_back(base+1); idxs.push_back(base+2);
+                idxs.push_back(base); idxs.push_back(base+2); idxs.push_back(base+3);
+            }
+        }
+        paletteIdxCount = (uint32_t)idxs.size();
+        VkDeviceSize vSize = sizeof(GVertex) * verts.size();
+        VkDeviceSize iSize = sizeof(uint32_t) * idxs.size();
+        createBuffer(vSize, VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
+            VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, paletteVbo, paletteVboMem);
+        createBuffer(iSize, VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT,
+            VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, paletteIbo, paletteIboMem);
+        copyToBuffer(paletteVbo, verts.data(), vSize);
+        copyToBuffer(paletteIbo, idxs.data(), iSize);
+        paletteDirty = false;
+    }
+
+    bool tryPickPalette(GLFWwindow* w) {
+        if (paletteDirty) buildPalette();
+        double mx, my;
+        glfwGetCursorPos(w, &mx, &my);
+        // Convert to NDC
+        float ndcX = (mx / WIDTH) * 2.0f - 1.0f;
+        float ndcY = -((my / HEIGHT) * 2.0f - 1.0f);
+
+        float cellW = 0.06f, cellH = 0.08f, gap = 0.005f;
+        float startX = -0.95f, startY = 0.80f;
+
+        int col = (int)((ndcX - startX) / (cellW + gap));
+        int row = (int)((startY - ndcY) / (cellH + gap));
+
+        // Check bounds within a cell
+        if (col >= 0 && col < PALETTE_COLS && row >= 0 && row < PALETTE_ROWS) {
+            float cx = startX + col * (cellW + gap);
+            float cy = startY - row * (cellH + gap);
+            if (ndcX >= cx && ndcX <= cx + cellW && ndcY <= cy && ndcY >= cy - cellH) {
+                auto rgb = adobeColors(row, col);
+                meshColor = glm::vec4(rgb.r, rgb.g, rgb.b, 1.0f);
+                paletteOpen = false;
+                updateTitle();
+                return true;
+            }
+        }
+        return false;
     }
     void applyDelta(float delta) {
         if (selAction == ACT_NONE) return;
@@ -1519,6 +1603,23 @@ private:
             vkCmdDrawIndexed(cb, strokeIdxCount, 1, 0, 0, 0);
         }
 
+        // ─── Color palette overlay (screen-space, no depth) ───────────
+        if (paletteOpen && paletteVbo != VK_NULL_HANDLE) {
+            if (paletteDirty) buildPalette();
+            // Use grid pipeline for screen-space quads (identity model)
+            vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, gridPipe);
+            VkDeviceSize poff = 0;
+            vkCmdBindVertexBuffers(cb, 0, 1, &paletteVbo, &poff);
+            vkCmdBindIndexBuffer(cb, paletteIbo, 0, VK_INDEX_TYPE_UINT32);
+            // Identity model (screen-space), white color (vertices have their own)
+            PushConst ppc{};
+            ppc.model = glm::mat4(1.0f);
+            ppc.color = glm::vec4(1.0f);
+            vkCmdPushConstants(cb, pipeLayout, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
+                0, sizeof(PushConst), &ppc);
+            vkCmdDrawIndexed(cb, paletteIdxCount, 1, 0, 0, 0);
+        }
+
         // ─── Draw mesh ────────────────────────────────────────────────
         glm::mat4 model = glm::translate(glm::mat4(1.0f), modelPos) * glm::mat4_cast(modelRot);
         PushConst mpc{};
@@ -1581,6 +1682,13 @@ private:
             vkFreeMemory(device, strokeVboMem, nullptr);
             vkDestroyBuffer(device, strokeIbo, nullptr);
             vkFreeMemory(device, strokeIboMem, nullptr);
+        }
+        // Palette buffers
+        if (paletteVbo != VK_NULL_HANDLE) {
+            vkDestroyBuffer(device, paletteVbo, nullptr);
+            vkFreeMemory(device, paletteVboMem, nullptr);
+            vkDestroyBuffer(device, paletteIbo, nullptr);
+            vkFreeMemory(device, paletteIboMem, nullptr);
         }
 
         vkDestroyCommandPool(device, cmdPool, nullptr);
