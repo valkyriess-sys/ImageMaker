@@ -10,6 +10,7 @@
 #include "mesh_postprocess.hpp"
 #include "gltf_export.hpp"
 #include "expression_template.hpp"
+#include "phoneme_to_viseme.hpp"
 #include "input.hpp"
 
 #include "imgui.h"
@@ -200,11 +201,21 @@ private:
     bool expressionMode = false;        // whether expression system is active
     bool expressionsInitialized = false;
 
+    // M8: Lip-sync system
+    BlendDelta visemeDeltas[VISEME_COUNT]; // pre-generated viseme deltas
+    LipSyncTrack lipSyncTrack;            // current animation track
+    bool lipSyncReady = false;            // visemes generated
+    bool lipSyncPlaying = false;          // playback active
+    float lipSyncTime = 0.0f;             // current playback time
+    int currentViseme = -1;               // current viseme index (-1 = none)
+    bool lipSyncUIOpen = false;           // ImGui panel toggle
+    char lipSyncText[512] = "Hello world!"; // input text buffer
+
     // ─── Window ──────────────────────────────────────────────────────
     void initWindow() {
         glfwInit();
         glfwWindowHint(GLFW_CLIENT_API, GLFW_NO_API);
-        window = glfwCreateWindow(WIDTH, HEIGHT, "ImageMaker M7 | F=Face mode 1-6=Expressions | L/scroll/+/−", nullptr, nullptr);
+        window = glfwCreateWindow(WIDTH, HEIGHT, "ImageMaker M7/8 | F=Face G=LipSync 1-6=Expressions | L/scroll/+/-", nullptr, nullptr);
         if (!window) { std::cerr << "Failed to create GLFW window (no display?)\n"; glfwTerminate(); exit(1); }
         glfwSetWindowUserPointer(window, this);
         glfwSetKeyCallback(window, keyCB);
@@ -230,6 +241,7 @@ private:
             if (key == GLFW_KEY_V) { app->toonMode = !app->toonMode; app->updateTitle(); }
             if (key == GLFW_KEY_C) { app->paletteOpen = !app->paletteOpen; app->updateTitle(); }
             if (key == GLFW_KEY_F) { app->toggleExpressionMode(); }
+            if (key == GLFW_KEY_G) { app->toggleLipSyncUI(); }
             if (key == GLFW_KEY_1) { app->selectExpression(0); }
             if (key == GLFW_KEY_2) { app->selectExpression(1); }
             if (key == GLFW_KEY_3) { app->selectExpression(2); }
@@ -332,11 +344,22 @@ private:
         const char* ac[] = {"none","Rotate","Move","Orbit","Zoom"};
         const char* exprNames[] = {"neutral","joy","anger","sadness","surprise","fear","disgust"};
         const char* exprName = (activeExpression >= 0 && activeExpression <= 5) ? exprNames[activeExpression + 1] : "neutral";
-        char buf[192];
-        snprintf(buf, sizeof(buf),
-            "ImageMaker M7 | Axis:%s Action:%s Expr:%s w=%.1f Mode:%s | 1-6/`/[/]/F/C/D/E/V",
-            ax[selAxis], ac[selAction], exprName, expressionWeight,
-            expressionMode ? "FACE" : "SCULPT");
+        char buf[256];
+        if (lipSyncPlaying) {
+            snprintf(buf, sizeof(buf),
+                "ImageMaker M8 | LipSync: %s t=%.1fs | G=toggle",
+                VisemeConfig::visemeName(currentViseme >= 0 ? currentViseme : 0),
+                lipSyncTime);
+        } else if (lipSyncUIOpen) {
+            snprintf(buf, sizeof(buf),
+                "ImageMaker M8 | LipSync Ready: \"%s\" (%.1fs) | G=toggle",
+                lipSyncTrack.transcript.c_str(), lipSyncTrack.totalDuration);
+        } else {
+            snprintf(buf, sizeof(buf),
+                "ImageMaker M7 | Axis:%s Action:%s Expr:%s w=%.1f Mode:%s | 1-6/`/[/]/F/G/C/D/E/V",
+                ax[selAxis], ac[selAction], exprName, expressionWeight,
+                expressionMode ? "FACE" : "SCULPT");
+        }
         glfwSetWindowTitle(window, buf);
     }
 
@@ -453,6 +476,84 @@ private:
             float len = std::sqrt(v.nx*v.nx + v.ny*v.ny + v.nz*v.nz);
             if (len > 1e-6f) { v.nx /= len; v.ny /= len; v.nz /= len; }
             else { v.nx = 0; v.ny = 1.0f; v.nz = 0; }
+        }
+    }
+
+    // ─── M8: Lip-sync helpers ────────────────────────────────────────
+    void initVisemes() {
+        if (lipSyncReady) return;
+        if (!expressionsInitialized) initExpressions();
+
+        VisemeConfig::generateAllVisemes(faceBase, visemeDeltas);
+        lipSyncReady = true;
+        printf("M8: Visemes initialized (16 viseme shapes)\n");
+    }
+
+    void applyViseme(int visemeIdx, float weight) {
+        if (!lipSyncReady || visemeIdx < 0 || visemeIdx >= VISEME_COUNT) return;
+        if (!expressionMode || !expressionsInitialized) return;
+
+        // Start from neutral face base
+        currentMeshVertices = faceBase.vertices;
+        meshIndices = faceBase.indices;
+
+        // Apply viseme delta
+        ExpressionTemplateSystem::applyExpression(
+            currentMeshVertices,
+            visemeDeltas[visemeIdx],
+            weight
+        );
+
+        recomputeMeshNormals();
+        meshIdxCount = (uint32_t)meshIndices.size();
+        meshDirty = true;
+        currentViseme = visemeIdx;
+    }
+
+    void toggleLipSyncUI() {
+        if (!expressionsInitialized) initExpressions();
+        if (!lipSyncReady) initVisemes();
+        if (!expressionMode) toggleExpressionMode(); // need face mode
+        lipSyncUIOpen = !lipSyncUIOpen;
+        if (!lipSyncUIOpen) {
+            lipSyncPlaying = false;
+            currentViseme = -1;
+            applyViseme(VISEME_REST, 1.0f);
+            updateTitle();
+        }
+    }
+
+    void lipSyncGenerate() {
+        if (!lipSyncReady) initVisemes();
+        if (!expressionMode) toggleExpressionMode();
+
+        lipSyncTrack = buildLipSync(lipSyncText);
+        lipSyncTime = 0.0f;
+        lipSyncPlaying = false;
+        currentViseme = -1;
+        applyViseme(VISEME_REST, 1.0f);
+        printf("M8: Lip-sync track built: \"%s\" (%zu keys, %.2fs)\n",
+               lipSyncText, lipSyncTrack.keys.size(), lipSyncTrack.totalDuration);
+    }
+
+    void updateLipSync(float dt) {
+        if (!lipSyncPlaying || !lipSyncReady) return;
+        if (!expressionMode) return;
+
+        lipSyncTime += dt;
+        if (lipSyncTime >= lipSyncTrack.totalDuration) {
+            // Playback finished
+            lipSyncPlaying = false;
+            lipSyncTime = lipSyncTrack.totalDuration;
+            applyViseme(VISEME_REST, 1.0f);
+            printf("M8: Lip-sync finished (%.2fs)\n", lipSyncTrack.totalDuration);
+            return;
+        }
+
+        // Find current viseme and apply
+        int vi = lipSyncTrack.sample(lipSyncTime);
+        if (vi != currentViseme) {
+            applyViseme(vi, 1.0f);
         }
     }
 
@@ -1595,21 +1696,110 @@ private:
                 ImGui::End();
             }
 
+            // M8: Lip-sync panel (G key toggle)
+            if (lipSyncUIOpen) {
+                ImGui::SetNextWindowPos(ImVec2(360, 10), ImGuiCond_FirstUseEver);
+                ImGui::SetNextWindowSize(ImVec2(380, 300), ImGuiCond_FirstUseEver);
+                ImGui::Begin("Lip-Sync##M8", &lipSyncUIOpen,
+                    ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoCollapse);
+                ImGui::Text("Text to animate:");
+                ImGui::InputTextMultiline("##text", lipSyncText, sizeof(lipSyncText),
+                    ImVec2(-1, 60));
+                if (ImGui::Button("Generate Track", ImVec2(-1, 0))) {
+                    lipSyncGenerate();
+                }
+                ImGui::Separator();
+                if (lipSyncTrack.totalDuration > 0.0f) {
+                    ImGui::Text("Duration: %.2fs | Keys: %zu | Viseme: %s",
+                        lipSyncTrack.totalDuration, lipSyncTrack.keys.size(),
+                        currentViseme >= 0 ? VisemeConfig::visemeName(currentViseme) : "-");
+                    ImGui::Text("Transcript: %s", lipSyncTrack.transcript.c_str());
+
+                    // Playback controls
+                    if (!lipSyncPlaying) {
+                        if (ImGui::Button("Play##ls", ImVec2(70, 0))) {
+                            lipSyncTime = 0.0f;
+                            lipSyncPlaying = true;
+                        }
+                        ImGui::SameLine();
+                    } else {
+                        if (ImGui::Button("Stop##ls", ImVec2(70, 0))) {
+                            lipSyncPlaying = false;
+                            lipSyncTime = 0.0f;
+                            applyViseme(VISEME_REST, 1.0f);
+                            updateTitle();
+                        }
+                        ImGui::SameLine();
+                        if (ImGui::Button("Pause##ls", ImVec2(70, 0))) {
+                            lipSyncPlaying = false;
+                        }
+                        ImGui::SameLine();
+                    }
+                    if (ImGui::Button("Reset##ls", ImVec2(70, 0))) {
+                        lipSyncPlaying = false;
+                        lipSyncTime = 0.0f;
+                        currentViseme = -1;
+                        applyViseme(VISEME_REST, 1.0f);
+                        updateTitle();
+                    }
+
+                    // Timeline progress bar
+                    float progress = lipSyncTime / lipSyncTrack.totalDuration;
+                    ImGui::ProgressBar(progress, ImVec2(-1, 20));
+                    ImGui::Text("Time: %.2f / %.2fs", lipSyncTime, lipSyncTrack.totalDuration);
+
+                    // Viseme preview: show which viseme maps to which keys
+                    if (ImGui::CollapsingHeader("Viseme Keys")) {
+                        for (size_t i = 0; i < lipSyncTrack.keys.size() && i < 50; i++) {
+                            bool active = (currentViseme == lipSyncTrack.keys[i].viseme);
+                            if (active) ImGui::PushStyleColor(ImGuiCol_Text, IM_COL32(255, 255, 0, 255));
+                            ImGui::Text("%3zu: t=%.2f %s",
+                                i, lipSyncTrack.keys[i].time,
+                                VisemeConfig::visemeName(lipSyncTrack.keys[i].viseme));
+                            if (active) ImGui::PopStyleColor();
+                        }
+                        if (lipSyncTrack.keys.size() > 50) {
+                            ImGui::Text("... (%zu total keys)", lipSyncTrack.keys.size());
+                        }
+                    }
+                } else {
+                    ImGui::Text("Enter text and click 'Generate Track'.");
+                }
+                ImGui::End();
+            }
+
+            // M8: Update lip-sync animation
+            if (lipSyncPlaying) {
+                static auto lastLipTime = glfwGetTime();
+                auto nowLipTime = glfwGetTime();
+                float dt = (float)(nowLipTime - lastLipTime);
+                lastLipTime = nowLipTime;
+                updateLipSync(dt);
+            }
+
             // Render
             ImGui::Render();
             drawFrame();
             frameCount++;
             auto now = glfwGetTime();
             if (now - lastTime >= 1.0) {
-                const char* exprNames[] = {"neutral","joy","anger","sadness","surprise","fear","disgust"};
-                const char* exprName = (activeExpression >= 0 && activeExpression <= 5) ? exprNames[activeExpression+1] : "neutral";
-                char buf[128];
-                snprintf(buf, sizeof(buf), "ImageMaker M7 | Axis:%s Action:%s Expr:%s w=%.1f Mode:%s | FPS:%d",
-                    (const char*[]){"none","X","Y","Z"}[selAxis],
-                    (const char*[]){"none","Rotate","Move","Orbit","Zoom"}[selAction],
-                    exprName, expressionWeight,
-                    expressionMode ? "FACE" : "SCULPT", frameCount);
-                glfwSetWindowTitle(window, buf);
+                if (lipSyncPlaying) {
+                    char buf[128];
+                    snprintf(buf, sizeof(buf), "ImageMaker M8 | LipSync: %s t=%.1f/%.1fs | FPS:%d",
+                        VisemeConfig::visemeName(currentViseme >= 0 ? currentViseme : 0),
+                        lipSyncTime, lipSyncTrack.totalDuration, frameCount);
+                    glfwSetWindowTitle(window, buf);
+                } else {
+                    const char* exprNames[] = {"neutral","joy","anger","sadness","surprise","fear","disgust"};
+                    const char* exprName = (activeExpression >= 0 && activeExpression <= 5) ? exprNames[activeExpression+1] : "neutral";
+                    char buf[128];
+                    snprintf(buf, sizeof(buf), "ImageMaker M7 | Axis:%s Action:%s Expr:%s w=%.1f Mode:%s | FPS:%d",
+                        (const char*[]){"none","X","Y","Z"}[selAxis],
+                        (const char*[]){"none","Rotate","Move","Orbit","Zoom"}[selAction],
+                        exprName, expressionWeight,
+                        expressionMode ? "FACE" : "SCULPT", frameCount);
+                    glfwSetWindowTitle(window, buf);
+                }
                 frameCount = 0;
                 lastTime = now;
             }
