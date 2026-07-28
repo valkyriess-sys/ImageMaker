@@ -29,6 +29,7 @@ add_executable(imagemaker
 target_include_directories(imagemaker PRIVATE
     ${Vulkan_INCLUDE_DIR}
     src
+    /home/valkyrie/.local/include
     vendor/imgui
     vendor/imgui/backends
 )
