@@ -27,3 +27,9 @@ secrets/
 
 # Logs
 *.log
+
+# M9 Image collection data (large, local-only)
+*.db
+reference/
+web_images/
+
