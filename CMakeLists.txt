@@ -18,11 +18,19 @@ find_package(glfw3 CONFIG REQUIRED)
 
 add_executable(imagemaker
     src/main.cpp
+    vendor/imgui/imgui.cpp
+    vendor/imgui/imgui_draw.cpp
+    vendor/imgui/imgui_tables.cpp
+    vendor/imgui/imgui_widgets.cpp
+    vendor/imgui/backends/imgui_impl_glfw.cpp
+    vendor/imgui/backends/imgui_impl_vulkan.cpp
 )
 
 target_include_directories(imagemaker PRIVATE
     ${Vulkan_INCLUDE_DIR}
     src
+    vendor/imgui
+    vendor/imgui/backends
 )
 
 target_link_libraries(imagemaker PRIVATE

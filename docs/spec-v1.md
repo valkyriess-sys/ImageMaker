@@ -170,7 +170,19 @@ struct SculptStroke {
 - 노말맵 베이크 (high-poly → low-poly)
 - glTF 2.0 export (tinygltf)
 
----
+### Phase 6: 자유곡선 → 3D 메시 생성 (Stroke-to-Mesh)
+- 입력: 화면에 그린 자유곡선 스트로크 (마우스 왼쪽 드래그)
+- 처리:
+  1. 스트로크를 3D 공간으로 투영 (카메라 레이 → 월드 포인트 시퀀스)
+  2. 곡선을 따라 튜브/로프 형태의 메시 생성 (Tube/Extrude)
+  3. 반경(radius): 스트로크 두께 또는 고정값 기준
+  4. 폐곡선(closed)이면 캡(cap) 처리하여 솔리드化
+- 출력: 독립된 3D 메시 객체 (씬에 추가)
+- 키 매핑: 예: 스트로크 모드 전용 토글 (시엘 제안받음)
+- 검증: 생성된 튜브 메시가 유효한 지오메트리 (non-degenerate, closed if source closed)
+
+#### 요구사항
+- REQ-SS-006 (자유곡선 → 3D 메시 변환)
 
 ## 4. 요구사항 (Normative, 초안)
 

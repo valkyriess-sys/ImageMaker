@@ -11,6 +11,10 @@
 #include "gltf_export.hpp"
 #include "input.hpp"
 
+#include "imgui.h"
+#include "imgui_impl_glfw.h"
+#include "imgui_impl_vulkan.h"
+
 #include <cstring>
 #include <iostream>
 #include <vector>
@@ -155,13 +159,9 @@ private:
     // M5: Toon shading
     bool toonMode = false;
 
-    // Color palette (Adobe-style overlay)
+    // Color palette (ImGui ColorPicker4)
     bool paletteOpen = false;
     glm::vec4 meshColor = glm::vec4(0.4f, 0.6f, 0.9f, 1.0f);
-    VkBuffer paletteVbo = VK_NULL_HANDLE, paletteIbo = VK_NULL_HANDLE;
-    VkDeviceMemory paletteVboMem = VK_NULL_HANDLE, paletteIboMem = VK_NULL_HANDLE;
-    uint32_t paletteIdxCount = 0;
-    bool paletteDirty = true;  // rebuild palette geometry on first open
 
     // Input state (track pressed keys no longer needed - using select pattern)
     // (keyPressed booleans removed — replaced by selectAxis/selectAction radio-toggle)
@@ -233,8 +233,6 @@ private:
         auto* app = (VulkanApp*)glfwGetWindowUserPointer(w);
         if (btn == GLFW_MOUSE_BUTTON_LEFT) {
             if (action == GLFW_PRESS) {
-                // Check palette hit first
-                if (app->paletteOpen && app->tryPickPalette(w)) return;
                 double now = glfwGetTime();
                 if (now - app->lastClickTime < DOUBLE_CLICK_THRESH) {
                     // Double-click: toggle object selection
@@ -324,98 +322,8 @@ private:
 
 
 
-    // M5: Color cycle helper
-    // ─── Color Palette ─────────────────────────────────────────────────
-    static constexpr int PALETTE_COLS = 8, PALETTE_ROWS = 4;
-    static constexpr int PALETTE_CELLS = PALETTE_COLS * PALETTE_ROWS;
-
-    // Adobe-style palette: rows by hue, columns by tint
-    static glm::vec3 adobeColors(int row, int col) {
-        float t = col / (float)(PALETTE_COLS - 1);
-        switch (row) {
-            case 0: // Red → Orange
-                return {0.9f, 0.15f + t * 0.5f, 0.1f + t * 0.2f};
-            case 1: // Yellow → Green
-                return {0.2f + t * 0.5f * (1 - t), 0.85f, 0.15f + t * 0.3f};
-            case 2: // Cyan → Blue
-                return {0.1f + t * 0.1f, 0.4f + t * 0.4f, 0.9f - t * 0.3f};
-            case 3: // Purple → Magenta
-                return {0.5f + t * 0.4f, 0.1f + t * 0.1f, 0.8f - t * 0.3f};
-            default: return {0.5f, 0.5f, 0.5f};
-        }
-    }
-
-    void buildPalette() {
-        // Destroy old buffers
-        if (paletteVbo != VK_NULL_HANDLE) {
-            vkDestroyBuffer(device, paletteVbo, nullptr);
-            vkFreeMemory(device, paletteVboMem, nullptr);
-            vkDestroyBuffer(device, paletteIbo, nullptr);
-            vkFreeMemory(device, paletteIboMem, nullptr);
-        }
-
-        float cellW = 0.06f, cellH = 0.08f;  // NDC size
-        float gap = 0.005f;
-        float startX = -0.95f, startY = 0.80f; // top-left corner
-
-        std::vector<GVertex> verts;
-        std::vector<uint32_t> idxs;
-
-        for (int r = 0; r < PALETTE_ROWS; r++) {
-            for (int c = 0; c < PALETTE_COLS; c++) {
-                float x = startX + c * (cellW + gap);
-                float y = startY - r * (cellH + gap);
-                glm::vec3 rgb = adobeColors(r, c);
-                glm::vec4 col(rgb.r, rgb.g, rgb.b, 1.0f);
-                uint32_t base = (uint32_t)verts.size();
-                verts.push_back({{x, y + cellH, 0}, col});       // top-left
-                verts.push_back({{x + cellW, y + cellH, 0}, col}); // top-right
-                verts.push_back({{x + cellW, y, 0}, col});        // bottom-right
-                verts.push_back({{x, y, 0}, col});               // bottom-left
-                idxs.push_back(base); idxs.push_back(base+1); idxs.push_back(base+2);
-                idxs.push_back(base); idxs.push_back(base+2); idxs.push_back(base+3);
-            }
-        }
-        paletteIdxCount = (uint32_t)idxs.size();
-        VkDeviceSize vSize = sizeof(GVertex) * verts.size();
-        VkDeviceSize iSize = sizeof(uint32_t) * idxs.size();
-        createBuffer(vSize, VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
-            VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, paletteVbo, paletteVboMem);
-        createBuffer(iSize, VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT,
-            VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, paletteIbo, paletteIboMem);
-        copyToBuffer(paletteVbo, verts.data(), vSize);
-        copyToBuffer(paletteIbo, idxs.data(), iSize);
-        paletteDirty = false;
-    }
-
-    bool tryPickPalette(GLFWwindow* w) {
-        if (paletteDirty) buildPalette();
-        double mx, my;
-        glfwGetCursorPos(w, &mx, &my);
-        // Convert to NDC
-        float ndcX = (mx / WIDTH) * 2.0f - 1.0f;
-        float ndcY = -((my / HEIGHT) * 2.0f - 1.0f);
-
-        float cellW = 0.06f, cellH = 0.08f, gap = 0.005f;
-        float startX = -0.95f, startY = 0.80f;
-
-        int col = (int)((ndcX - startX) / (cellW + gap));
-        int row = (int)((startY - ndcY) / (cellH + gap));
-
-        // Check bounds within a cell
-        if (col >= 0 && col < PALETTE_COLS && row >= 0 && row < PALETTE_ROWS) {
-            float cx = startX + col * (cellW + gap);
-            float cy = startY - row * (cellH + gap);
-            if (ndcX >= cx && ndcX <= cx + cellW && ndcY <= cy && ndcY >= cy - cellH) {
-                auto rgb = adobeColors(row, col);
-                meshColor = glm::vec4(rgb.r, rgb.g, rgb.b, 1.0f);
-                paletteOpen = false;
-                updateTitle();
-                return true;
-            }
-        }
-        return false;
-    }
+    // M5: Color cycle helper (replaced by ImGui ColorPicker4)
+    // ─── M5: Toon Shading Helpers ─────────────────────────────────────
     void applyDelta(float delta) {
         if (selAction == ACT_NONE) return;
         if (selAction == ACT_ZOOM || selAction == ACT_ORBIT) {
@@ -857,6 +765,7 @@ private:
         createPipelines();
         createFramebuffers();
         createCommandPool();
+        initImGui();
         createUniformBuffers();
         createDescriptorPool();
         createDescriptorSets();
@@ -1227,6 +1136,78 @@ private:
         vkCreateCommandPool(device, &ci, nullptr, &cmdPool);
     }
 
+    VkDescriptorPool imguiPool = VK_NULL_HANDLE;
+
+    void initImGui() {
+        IMGUI_CHECKVERSION();
+        ImGui::CreateContext();
+        ImGuiIO& io = ImGui::GetIO();
+        io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
+        io.IniFilename = nullptr;
+
+        ImGui_ImplGlfw_InitForVulkan(window, true);
+
+        // Descriptor pool for ImGui
+        VkDescriptorPoolSize poolSizes[] = {
+            {VK_DESCRIPTOR_TYPE_SAMPLER, 1000},
+            {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1000},
+            {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 1000},
+            {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1000},
+            {VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER, 1000},
+            {VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER, 1000},
+            {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1000},
+            {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1000},
+            {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, 1000},
+            {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC, 1000},
+            {VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT, 1000}
+        };
+        VkDescriptorPoolCreateInfo pi{};
+        pi.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+        pi.flags = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT;
+        pi.maxSets = 1000 * IM_ARRAYSIZE(poolSizes);
+        pi.poolSizeCount = IM_ARRAYSIZE(poolSizes);
+        pi.pPoolSizes = poolSizes;
+        vkCreateDescriptorPool(device, &pi, nullptr, &imguiPool);
+
+        ImGui_ImplVulkan_InitInfo vi{};
+        vi.Instance = instance;
+        vi.PhysicalDevice = physDev;
+        vi.Device = device;
+        vi.QueueFamily = findQueueFamilies(physDev).graphics.value();
+        vi.Queue = gfxQueue;
+        vi.DescriptorPool = imguiPool;
+        vi.PipelineCache = VK_NULL_HANDLE;
+        vi.MinImageCount = MAX_FRAMES_IN_FLIGHT;
+        vi.ImageCount = MAX_FRAMES_IN_FLIGHT;
+        vi.PipelineInfoMain.RenderPass = renderPass;
+        vi.PipelineInfoMain.Subpass = 0;
+        vi.PipelineInfoMain.MSAASamples = VK_SAMPLE_COUNT_1_BIT;
+        ImGui_ImplVulkan_Init(&vi);
+    }
+
+    VkCommandBuffer beginSingleTimeCommands() {
+        VkCommandBufferAllocateInfo ai{};
+        ai.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+        ai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+        ai.commandPool = cmdPool; ai.commandBufferCount = 1;
+        VkCommandBuffer cb;
+        vkAllocateCommandBuffers(device, &ai, &cb);
+        VkCommandBufferBeginInfo bi{};
+        bi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+        bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+        vkBeginCommandBuffer(cb, &bi);
+        return cb;
+    }
+
+    void endSingleTimeCommands(VkCommandBuffer cb) {
+        vkEndCommandBuffer(cb);
+        VkSubmitInfo si{}; si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+        si.commandBufferCount = 1; si.pCommandBuffers = &cb;
+        vkQueueSubmit(gfxQueue, 1, &si, VK_NULL_HANDLE);
+        vkQueueWaitIdle(gfxQueue);
+        vkFreeCommandBuffers(device, cmdPool, 1, &cb);
+    }
+
     // ─── Buffer helpers ───────────────────────────────────────────────
     uint32_t findMemoryType(uint32_t typeFilter, VkMemoryPropertyFlags props) {
         VkPhysicalDeviceMemoryProperties mp;
@@ -1437,6 +1418,26 @@ private:
         int frameCount = 0;
         while (!glfwWindowShouldClose(window)) {
             glfwPollEvents();
+
+            // Start ImGui frame
+            ImGui_ImplVulkan_NewFrame();
+            ImGui_ImplGlfw_NewFrame();
+            ImGui::NewFrame();
+
+            // Color picker window (C key toggle)
+            if (paletteOpen) {
+                ImGui::SetNextWindowPos(ImVec2(10, 10), ImGuiCond_FirstUseEver);
+                ImGui::SetNextWindowSize(ImVec2(320, 420), ImGuiCond_FirstUseEver);
+                ImGui::Begin("Color Picker##M5", &paletteOpen,
+                    ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoCollapse);
+                ImGui::ColorPicker4("##picker", (float*)&meshColor,
+                    ImGuiColorEditFlags_AlphaBar | ImGuiColorEditFlags_DisplayRGB |
+                    ImGuiColorEditFlags_DisplayHex | ImGuiColorEditFlags_PickerHueWheel);
+                ImGui::End();
+            }
+
+            // Render
+            ImGui::Render();
             drawFrame();
             frameCount++;
             auto now = glfwGetTime();
@@ -1604,21 +1605,7 @@ private:
         }
 
         // ─── Color palette overlay (screen-space, no depth) ───────────
-        if (paletteOpen && paletteVbo != VK_NULL_HANDLE) {
-            if (paletteDirty) buildPalette();
-            // Use grid pipeline for screen-space quads (identity model)
-            vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, gridPipe);
-            VkDeviceSize poff = 0;
-            vkCmdBindVertexBuffers(cb, 0, 1, &paletteVbo, &poff);
-            vkCmdBindIndexBuffer(cb, paletteIbo, 0, VK_INDEX_TYPE_UINT32);
-            // Identity model (screen-space), white color (vertices have their own)
-            PushConst ppc{};
-            ppc.model = glm::mat4(1.0f);
-            ppc.color = glm::vec4(1.0f);
-            vkCmdPushConstants(cb, pipeLayout, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
-                0, sizeof(PushConst), &ppc);
-            vkCmdDrawIndexed(cb, paletteIdxCount, 1, 0, 0, 0);
-        }
+        // (Replaced by ImGui ColorPicker4)
 
         // ─── Draw mesh ────────────────────────────────────────────────
         glm::mat4 model = glm::translate(glm::mat4(1.0f), modelPos) * glm::mat4_cast(modelRot);
@@ -1652,6 +1639,9 @@ private:
             0, sizeof(PushConst), &mpc);
         vkCmdDrawIndexed(cb, meshIdxCount, 1, 0, 0, 0);
 
+        // ImGui draw data
+        ImGui_ImplVulkan_RenderDrawData(ImGui::GetDrawData(), cb);
+
         vkCmdEndRenderPass(cb);
         vkEndCommandBuffer(cb);
     }
@@ -1659,6 +1649,15 @@ private:
     // ─── Cleanup ─────────────────────────────────────────────────────
     void cleanup() {
         vkDeviceWaitIdle(device);
+
+        // ImGui cleanup
+        ImGui_ImplVulkan_Shutdown();
+        ImGui_ImplGlfw_Shutdown();
+        ImGui::DestroyContext();
+        if (imguiPool != VK_NULL_HANDLE) {
+            vkDestroyDescriptorPool(device, imguiPool, nullptr);
+        }
+
         for (int i = 0; i < MAX_FRAMES_IN_FLIGHT; i++) {
             vkDestroySemaphore(device, imgAvail[i], nullptr);
             vkDestroySemaphore(device, renderDone[i], nullptr);
@@ -1682,13 +1681,6 @@ private:
             vkFreeMemory(device, strokeVboMem, nullptr);
             vkDestroyBuffer(device, strokeIbo, nullptr);
             vkFreeMemory(device, strokeIboMem, nullptr);
-        }
-        // Palette buffers
-        if (paletteVbo != VK_NULL_HANDLE) {
-            vkDestroyBuffer(device, paletteVbo, nullptr);
-            vkFreeMemory(device, paletteVboMem, nullptr);
-            vkDestroyBuffer(device, paletteIbo, nullptr);
-            vkFreeMemory(device, paletteIboMem, nullptr);
         }
 
         vkDestroyCommandPool(device, cmdPool, nullptr);
