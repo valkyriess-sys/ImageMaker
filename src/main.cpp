@@ -9,6 +9,7 @@
 #include "mesh_generator.hpp"
 #include "mesh_postprocess.hpp"
 #include "gltf_export.hpp"
+#include "expression_template.hpp"
 #include "input.hpp"
 
 #include "imgui.h"
@@ -191,11 +192,19 @@ private:
     bool showDecimated = false;        // toggle: show decimated instead of original
     std::string exportDir = "exports"; // output directory for glTF files
 
+    // M7: Expression template system
+    Mesh faceBase;                      // standard face base mesh (neutral)
+    BlendDelta expressionDeltas[6];     // joy, anger, sadness, surprise, fear, disgust
+    int activeExpression = -1;          // -1=neutral, 0=joy, 1=anger, 2=sadness, 3=surprise, 4=fear, 5=disgust
+    float expressionWeight = 1.0f;      // blend weight (0.0 ~ 1.0)
+    bool expressionMode = false;        // whether expression system is active
+    bool expressionsInitialized = false;
+
     // ─── Window ──────────────────────────────────────────────────────
     void initWindow() {
         glfwInit();
         glfwWindowHint(GLFW_CLIENT_API, GLFW_NO_API);
-        window = glfwCreateWindow(WIDTH, HEIGHT, "ImageMaker M6 | Axis:none Action:none Mode:SCULPT | L/scroll/+/−", nullptr, nullptr);
+        window = glfwCreateWindow(WIDTH, HEIGHT, "ImageMaker M7 | F=Face mode 1-6=Expressions | L/scroll/+/−", nullptr, nullptr);
         if (!window) { std::cerr << "Failed to create GLFW window (no display?)\n"; glfwTerminate(); exit(1); }
         glfwSetWindowUserPointer(window, this);
         glfwSetKeyCallback(window, keyCB);
@@ -220,6 +229,16 @@ private:
             if (key == GLFW_KEY_E) { app->exportMesh(); }
             if (key == GLFW_KEY_V) { app->toonMode = !app->toonMode; app->updateTitle(); }
             if (key == GLFW_KEY_C) { app->paletteOpen = !app->paletteOpen; app->updateTitle(); }
+            if (key == GLFW_KEY_F) { app->toggleExpressionMode(); }
+            if (key == GLFW_KEY_1) { app->selectExpression(0); }
+            if (key == GLFW_KEY_2) { app->selectExpression(1); }
+            if (key == GLFW_KEY_3) { app->selectExpression(2); }
+            if (key == GLFW_KEY_4) { app->selectExpression(3); }
+            if (key == GLFW_KEY_5) { app->selectExpression(4); }
+            if (key == GLFW_KEY_6) { app->selectExpression(5); }
+            if (key == GLFW_KEY_GRAVE_ACCENT) { app->selectExpression(-1); } // backtick = neutral
+            if (key == GLFW_KEY_LEFT_BRACKET) { app->adjustExpressionWeight(-0.1f); }
+            if (key == GLFW_KEY_RIGHT_BRACKET) { app->adjustExpressionWeight(0.1f); }
             if (key == GLFW_KEY_EQUAL || key == GLFW_KEY_KP_ADD) app->applyDelta(0.1f);
             if (key == GLFW_KEY_MINUS || key == GLFW_KEY_KP_SUBTRACT) app->applyDelta(-0.1f);
             if (key == GLFW_KEY_ESCAPE) glfwSetWindowShouldClose(w, true);
@@ -311,13 +330,147 @@ private:
     void updateTitle() {
         const char* ax[] = {"none","X","Y","Z"};
         const char* ac[] = {"none","Rotate","Move","Orbit","Zoom"};
+        const char* exprNames[] = {"neutral","joy","anger","sadness","surprise","fear","disgust"};
+        const char* exprName = (activeExpression >= 0 && activeExpression <= 5) ? exprNames[activeExpression + 1] : "neutral";
         char buf[192];
         snprintf(buf, sizeof(buf),
-            "ImageMaker M5 | Axis:%s Action:%s Obj:%s Toon:%s Color:#%02x%02x%02x | V/C/D/E/scroll/+/-",
-            ax[selAxis], ac[selAction], selObject >= 0 ? "#0" : "none",
-            toonMode ? "ON" : "OFF",
-            (int)(meshColor.r*255) & 0xFF, (int)(meshColor.g*255) & 0xFF, (int)(meshColor.b*255) & 0xFF);
+            "ImageMaker M7 | Axis:%s Action:%s Expr:%s w=%.1f Mode:%s | 1-6/`/[/]/F/C/D/E/V",
+            ax[selAxis], ac[selAction], exprName, expressionWeight,
+            expressionMode ? "FACE" : "SCULPT");
         glfwSetWindowTitle(window, buf);
+    }
+
+    // ─── M7: Expression system helpers ─────────────────────────────────
+    void initExpressions() {
+        if (expressionsInitialized) return;
+
+        faceBase = ExpressionTemplateSystem::generateFaceBase(1.0f);
+        expressionDeltas[0] = ExpressionTemplateSystem::joy(faceBase);
+        expressionDeltas[1] = ExpressionTemplateSystem::anger(faceBase);
+        expressionDeltas[2] = ExpressionTemplateSystem::sadness(faceBase);
+        expressionDeltas[3] = ExpressionTemplateSystem::surprise(faceBase);
+        expressionDeltas[4] = ExpressionTemplateSystem::fear(faceBase);
+        expressionDeltas[5] = ExpressionTemplateSystem::disgust(faceBase);
+
+        // Also save templates to disk
+        ExpressionTemplateSystem::initializeTemplates("templates");
+
+        expressionsInitialized = true;
+        printf("M7: Expressions initialized (6 emotions + neutral)\n");
+        printf("    Keys: 1=joy 2=anger 3=sadness 4=surprise 5=fear 6=disgust `=neutral [/]=weight\n");
+    }
+
+    void toggleExpressionMode() {
+        if (!expressionsInitialized) initExpressions();
+
+        expressionMode = !expressionMode;
+        if (expressionMode) {
+            // Switch to face base mesh
+            currentMeshVertices = faceBase.vertices;
+            meshIndices = faceBase.indices;
+            baseVertices = faceBase.vertices;
+            meshIdxCount = (uint32_t)meshIndices.size();
+            meshDirty = true;
+            activeExpression = -1;
+            expressionWeight = 1.0f;
+        } else {
+            // Reset to default sphere
+            Mesh m = PrimitiveGenerator::generateIcoSphere(1.0f, 3);
+            currentMeshVertices = m.vertices;
+            meshIndices = m.indices;
+            baseVertices = m.vertices;
+            meshIdxCount = (uint32_t)m.indices.size();
+            meshDirty = true;
+            activeExpression = -1;
+            showDecimated = false;
+        }
+        updateTitle();
+    }
+
+    void selectExpression(int idx) {
+        if (!expressionMode || !expressionsInitialized) return;
+        if (idx >= 6 || idx < -1) return;
+
+        if (activeExpression == idx) {
+            // Deselect
+            activeExpression = -1;
+            // Reset to neutral face
+            currentMeshVertices = faceBase.vertices;
+            meshIndices = faceBase.indices;
+            baseVertices = faceBase.vertices;
+            meshDirty = true;
+        } else {
+            activeExpression = idx;
+            applyCurrentExpression();
+        }
+        updateTitle();
+    }
+
+    void adjustExpressionWeight(float delta) {
+        if (!expressionMode) return;
+        expressionWeight = std::max(0.0f, std::min(1.0f, expressionWeight + delta));
+        if (activeExpression >= 0) {
+            applyCurrentExpression();
+        }
+        updateTitle();
+    }
+
+    void applyCurrentExpression() {
+        if (!expressionsInitialized || activeExpression < 0 || activeExpression >= 6) return;
+
+        // Start from neutral face base
+        currentMeshVertices = faceBase.vertices;
+        meshIndices = faceBase.indices;
+
+        // Apply expression delta
+        ExpressionTemplateSystem::applyExpression(
+            currentMeshVertices,
+            expressionDeltas[activeExpression],
+            expressionWeight
+        );
+
+        // Recompute normals for the modified mesh
+        recomputeMeshNormals();
+
+        meshIdxCount = (uint32_t)meshIndices.size();
+        meshDirty = true;
+    }
+
+    void recomputeMeshNormals() {
+        for (auto& v : currentMeshVertices) { v.nx = 0; v.ny = 0; v.nz = 0; }
+        for (size_t i = 0; i + 2 < meshIndices.size(); i += 3) {
+            auto& v0 = currentMeshVertices[meshIndices[i]];
+            auto& v1 = currentMeshVertices[meshIndices[i+1]];
+            auto& v2 = currentMeshVertices[meshIndices[i+2]];
+            glm::vec3 e1(v1.x - v0.x, v1.y - v0.y, v1.z - v0.z);
+            glm::vec3 e2(v2.x - v0.x, v2.y - v0.y, v2.z - v0.z);
+            glm::vec3 n = glm::cross(e1, e2);
+            v0.nx += n.x; v0.ny += n.y; v0.nz += n.z;
+            v1.nx += n.x; v1.ny += n.y; v1.nz += n.z;
+            v2.nx += n.x; v2.ny += n.y; v2.nz += n.z;
+        }
+        for (auto& v : currentMeshVertices) {
+            float len = std::sqrt(v.nx*v.nx + v.ny*v.ny + v.nz*v.nz);
+            if (len > 1e-6f) { v.nx /= len; v.ny /= len; v.nz /= len; }
+            else { v.nx = 0; v.ny = 1.0f; v.nz = 0; }
+        }
+    }
+
+    void exportExpressionGLB() {
+        if (!expressionsInitialized) return;
+
+        std::string mkdirCmd = "mkdir -p " + exportDir;
+        if (system(mkdirCmd.c_str()) != 0) {
+            fprintf(stderr, "Warning: failed to create exports dir\n");
+        }
+
+        // Export base face + all 6 expression morph targets
+        std::string path = exportDir + "/face_expressions.glb";
+        GLTFExporter::exportGLBWithMorphTargets(
+            path, faceBase.vertices, faceBase.indices,
+            expressionDeltas, 6, meshColor);
+
+        printf("Expression GLB exported: %s\n", path.c_str());
     }
 
 
@@ -670,7 +823,7 @@ private:
         updateTitle();
     }
 
-    // ─── M4: Export mesh as glTF ──────────────────────────────────────
+    // ─── M4/M7: Export mesh as glTF ──────────────────────────────────────
     void exportMesh() {
         if (currentMeshVertices.empty()) return;
 
@@ -678,6 +831,12 @@ private:
         std::string mkdirCmd = "mkdir -p " + exportDir;
         if (system(mkdirCmd.c_str()) != 0) {
             fprintf(stderr, "Warning: failed to create exports dir\n");
+        }
+
+        // M7: If in expression mode, export face + morph targets
+        if (expressionMode && expressionsInitialized) {
+            exportExpressionGLB();
+            return;
         }
 
         // Export original (high-poly) with mesh color
@@ -1442,13 +1601,14 @@ private:
             frameCount++;
             auto now = glfwGetTime();
             if (now - lastTime >= 1.0) {
+                const char* exprNames[] = {"neutral","joy","anger","sadness","surprise","fear","disgust"};
+                const char* exprName = (activeExpression >= 0 && activeExpression <= 5) ? exprNames[activeExpression+1] : "neutral";
                 char buf[128];
-                snprintf(buf, sizeof(buf), "ImageMaker M6 | Axis:%s Action:%s Obj:%s Brush:%s Decimate:%s | FPS:%d",
+                snprintf(buf, sizeof(buf), "ImageMaker M7 | Axis:%s Action:%s Expr:%s w=%.1f Mode:%s | FPS:%d",
                     (const char*[]){"none","X","Y","Z"}[selAxis],
                     (const char*[]){"none","Rotate","Move","Orbit","Zoom"}[selAction],
-                    selObject >= 0 ? "#0" : "none",
-                    brushThickness > 0 ? "ADD" : "SUB",
-                    showDecimated ? "ON" : "OFF", frameCount);
+                    exprName, expressionWeight,
+                    expressionMode ? "FACE" : "SCULPT", frameCount);
                 glfwSetWindowTitle(window, buf);
                 frameCount = 0;
                 lastTime = now;
