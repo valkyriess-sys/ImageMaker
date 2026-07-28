@@ -33,3 +33,11 @@ secrets/
 reference/
 web_images/
 
+# M10 Expression extractor model file (~3.6 MB, downloaded)
+tools/expression_extractor/face_landmarker.task
+
+# Extracted templates (generated, can be regenerated from M9 DB)
+templates/expressions/
+templates/catalog.json
+templates/canonical_neutral.npy
+

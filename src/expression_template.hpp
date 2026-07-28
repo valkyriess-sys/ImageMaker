@@ -523,6 +523,109 @@ public:
         return result;
     }
 
+    // ─── 9. Load extracted templates (M10 pipeline) ────────────────────
+    //
+    // Loads expression deltas extracted from real photos by the M10
+    // MediaPipe pipeline (tools/expression_extractor/).
+    //
+    // These complement the procedurally-generated expressions (joy, anger,
+    // etc.) with data-driven deltas from actual facial images.
+    //
+    // Usage:
+    //   auto extracted = ExpressionTemplateSystem::loadExtractedTemplates(
+    //       base, "templates/");
+    //   // extracted is a vector of BlendDelta, ready for applyExpression
+    //
+    static std::vector<BlendDelta> loadExtractedTemplates(
+            const Mesh& base, const std::string& templateDir = "templates") {
+
+        std::vector<BlendDelta> result;
+
+        // Try to load from catalog.json first
+        std::string catalogPath = templateDir + "/catalog.json";
+        std::ifstream catFile(catalogPath);
+        if (!catFile.is_open()) {
+            // Fall back to scanning expressions/ directory
+            std::string exprDir = templateDir + "/expressions";
+            // Simple directory scan for .delta files
+            // (We can't easily list directories in portable C++, so
+            //  we try known expression names)
+            const char* knownExprs[] = {
+                "joy_synth", "anger_synth", "sadness_synth",
+                "surprise_synth", "fear_synth", "disgust_synth",
+                "neutral_synth",
+                "joy", "anger", "sadness", "surprise", "fear", "disgust",
+                "neutral"
+            };
+            for (const char* name : knownExprs) {
+                std::string dpath = exprDir + "/" + name + ".delta";
+                std::ifstream test(dpath);
+                if (test.is_open()) {
+                    test.close();
+                    BlendDelta delta = loadDelta(dpath);
+                    if (delta.offsets.size() == base.vertices.size()) {
+                        result.push_back(delta);
+                        printf("M10: loaded extracted template '%s' (%zu verts)\n",
+                               delta.name.c_str(), delta.offsets.size());
+                    } else {
+                        fprintf(stderr,
+                            "M10: vertex count mismatch in '%s' (%zu vs %zu), skipping\n",
+                            delta.name.c_str(), delta.offsets.size(),
+                            base.vertices.size());
+                    }
+                }
+            }
+            return result;
+        }
+
+        // Parse catalog.json (simple JSON parser)
+        std::stringstream buffer;
+        buffer << catFile.rdbuf();
+        catFile.close();
+        std::string json = buffer.str();
+
+        // Extract expression entries: {"name":"...", "file":"...", "vertexCount":...}
+        size_t pos = 0;
+        while ((pos = json.find("\"name\":\"", pos)) != std::string::npos) {
+            pos += 8; // skip "name":"
+            size_t nameEnd = json.find("\"", pos);
+            if (nameEnd == std::string::npos) break;
+            std::string name = json.substr(pos, nameEnd - pos);
+
+            // Find file
+            size_t filePos = json.find("\"file\":\"", nameEnd);
+            if (filePos == std::string::npos) break;
+            filePos += 8;
+            size_t fileEnd = json.find("\"", filePos);
+            if (fileEnd == std::string::npos) break;
+            std::string file = json.substr(filePos, fileEnd - filePos);
+
+            pos = fileEnd;
+
+            // Load the delta
+            std::string fullPath = templateDir + "/" + file;
+            std::ifstream test(fullPath);
+            if (!test.is_open()) {
+                fprintf(stderr, "M10: delta file not found: %s\n", fullPath.c_str());
+                continue;
+            }
+            test.close();
+
+            BlendDelta delta = loadDelta(fullPath);
+            if (delta.offsets.size() == base.vertices.size()) {
+                result.push_back(delta);
+                printf("M10: loaded extracted template '%s' from %s (%zu verts)\n",
+                       name.c_str(), file.c_str(), delta.offsets.size());
+            } else {
+                fprintf(stderr,
+                    "M10: vertex count mismatch in '%s' (%zu vs %zu), skipping\n",
+                    name.c_str(), delta.offsets.size(), base.vertices.size());
+            }
+        }
+
+        return result;
+    }
+
 private:
     static void ensureDir(const std::string& path) {
         // Extract directory part
