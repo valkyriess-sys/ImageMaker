@@ -1,0 +1,75 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Sketch-to-3D MVP</title>
+  <link rel="stylesheet" href="css/app.css">
+</head>
+<body>
+  <div id="app">
+    <header id="toolbar">
+      <div class="toolbar-group">
+        <label>브러시:</label>
+        <select id="brush-select">
+          <option value="pencil">연필 (0.8px)</option>
+          <option value="pen" selected>펜 (1.5px)</option>
+          <option value="marker">사인펜 (3.0px)</option>
+          <option value="brush">붓 (4.5px)</option>
+        </select>
+      </div>
+      <div class="toolbar-group">
+        <label>각도:</label>
+        <input type="radio" name="angle" value="0" id="angle-0">
+        <label for="angle-0">0°</label>
+        <input type="radio" name="angle" value="45" id="angle-45" checked>
+        <label for="angle-45">45°</label>
+        <input type="radio" name="angle" value="-45" id="angle-neg45">
+        <label for="angle-neg45">-45°</label>
+      </div>
+      <div class="toolbar-group">
+        <label>가이드:</label>
+        <select id="guide-select">
+          <option value="none">없음</option>
+          <option value="cube">입체 (큐브)</option>
+          <option value="sphere">구</option>
+          <option value="cylinder">원기둥</option>
+          <option value="cone">원뿔</option>
+          <option value="torus">원환</option>
+          <option value="torus2">원환둥</option>
+          <option value="mannequin-male">남성</option>
+          <option value="mannequin-female">여성</option>
+          <option value="mannequin-adult">성인</option>
+          <option value="mannequin-youth">소년</option>
+          <option value="mannequin-boy">소년(남)</option>
+          <option value="mannequin-girl">소년(여)</option>
+          <option value="mannequin-child-m">아동(남)</option>
+          <option value="mannequin-child-f">아동(여)</option>
+        </select>
+      </div>
+      <div class="toolbar-group">
+        <label>뷰모드:</label>
+        <div id="view-modes"></div>
+        <span id="view-mode-label">일반 3D</span>
+      </div>
+      <div class="toolbar-group">
+        <button id="btn-save">저장</button>
+        <button id="btn-load">불러오기</button>
+        <button id="btn-clear">지우기</button>
+      </div>
+    </header>
+    <main id="canvas-container">
+      <canvas id="canvas"></canvas>
+    </main>
+    <footer id="statusbar">
+      <span id="status-text">준비</span>
+    </footer>
+  </div>
+  <script src="js/core.js"></script>
+  <script src="js/render.js"></script>
+  <script src="js/input.js"></script>
+  <script src="js/guides.js"></script>
+  <script src="js/viewModes.js"></script>
+  <script src="js/app.js"></script>
+</body>
+</html>

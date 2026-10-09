@@ -1,0 +1,9 @@
+{
+  "name": "sketch-to-3d-mvp",
+  "version": "0.1.0",
+  "description": "2D 스케치→3D 복원 MVP — 웹 캔버스 기반 다중 뷰 스케치 시스템",
+  "private": true,
+  "scripts": {
+    "test": "node --test test/core.test.js"
+  }
+}
