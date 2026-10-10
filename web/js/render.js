@@ -1,9 +1,10 @@
-// render.js — 렌더링 파이프라인 (standard/cel/dummy 뷰모드)
+// render.js — 렌더링 파이프라인 (standard/cel/dummy 뷰모드) + M12 메쉬 렌더링
 
 (function(global) {
   'use strict';
 
   const Core = global.SketchCore;
+  const Mesh = global.SketchMesh;
 
   // ── 배경 그리기 ──
   function drawBackground(ctx, width, height) {
@@ -178,6 +179,76 @@
     ctx.restore();
   }
 
+  // ── M12: Visual Hull 메쉬 렌더링 ──
+  function drawVisualHullMesh(ctx, mesh, currentAngle, currentViewport, canvasWidth, canvasHeight, color) {
+    if (!mesh.vertices || !mesh.faces) return;
+    ctx.save();
+
+    // 월드 → 카메라 변환
+    const camPoints = mesh.vertices.map(v => {
+      return Core.worldToCamera(v.x, v.y, v.z, currentAngle);
+    });
+
+    // 깊이 정렬 (painter's algorithm)
+    const facesWithDepth = mesh.faces.map((face, idx) => {
+      let zSum = 0;
+      for (const vi of face) zSum += camPoints[vi].z;
+      return { face, idx, avgZ: zSum / face.length };
+    }).sort((a, b) => a.avgZ - b.avgZ);
+
+    const baseColor = color || { r: 0.4, g: 0.6, b: 0.9, a: 1 };
+
+    for (const { face, idx } of facesWithDepth) {
+      // 법선 계산 (카메라 좌표계)
+      const p0 = camPoints[face[0]];
+      const p1 = camPoints[face[1]];
+      const p2 = camPoints[face[2]];
+      const ux = p1.x - p0.x, uy = p1.y - p0.y, uz = p1.z - p0.z;
+      const vx = p2.x - p0.x, vy = p2.y - p0.y, vz = p2.z - p0.z;
+      let nx = uy * vz - uz * vy;
+      let ny = uz * vx - ux * vz;
+      let nz = ux * vy - uy * vx;
+      const len = Math.sqrt(nx * nx + ny * ny + nz * nz);
+      if (len > 0) { nx /= len; ny /= len; nz /= len; }
+
+      // 조명 (카메라 방향에서 비춤)
+      const lightDir = { x: 0, y: 0, z: 1 };
+      const dot = nx * lightDir.x + ny * lightDir.y + nz * lightDir.z;
+      const intensity = Math.max(0, dot);
+
+      // 색상 결정 (단색 + 조명)
+      const tone = 0.3 + intensity * 0.7;
+      const r = baseColor.r * tone * 255;
+      const g = baseColor.g * tone * 255;
+      const b = baseColor.b * tone * 255;
+      const a = baseColor.a;
+
+      // 스크린 좌표로 변환
+      const screenPts = face.map(vi => {
+        const cam = camPoints[vi];
+        return {
+          x: (cam.x - currentViewport.centerX) * currentViewport.scale + canvasWidth / 2,
+          y: -(cam.y - currentViewport.centerY) * currentViewport.scale + canvasHeight / 2
+        };
+      });
+
+      ctx.fillStyle = `rgba(${r|0},${g|0},${b|0},${a})`;
+      ctx.beginPath();
+      ctx.moveTo(screenPts[0].x, screenPts[0].y);
+      for (let i = 1; i < screenPts.length; i++) {
+        ctx.lineTo(screenPts[i].x, screenPts[i].y);
+      }
+      ctx.closePath();
+      ctx.fill();
+
+      // 외곽선
+      ctx.strokeStyle = 'rgba(20,20,40,0.6)';
+      ctx.lineWidth = 0.5;
+      ctx.stroke();
+    }
+    ctx.restore();
+  }
+
   // ── 전체 렌더 ──
   function render(ctx, state, guide, brush, viewMode, canvasWidth, canvasHeight) {
     drawBackground(ctx, canvasWidth, canvasHeight);
@@ -209,6 +280,11 @@
         drawShadedMesh(ctx, guide, state.currentAngle, state.viewport, canvasWidth, canvasHeight, viewMode);
       }
     }
+
+    // M12: Visual Hull 메쉬 렌더링
+    if (state.visualHullMesh) {
+      drawVisualHullMesh(ctx, state.visualHullMesh, state.currentAngle, state.viewport, canvasWidth, canvasHeight);
+    }
   }
 
   // ── 내보내기 ──
@@ -219,6 +295,7 @@
     drawOnionSkin,
     drawGuide,
     drawShadedMesh,
+    drawVisualHullMesh,
     render
   };
 
