@@ -47,39 +47,129 @@
   // - 각 뷰의 실루엣을 3D 공간에 배치
   // - 인접 뷰 간의 포인트를 연결하여 측면 메시 생성
   // - 양 끝 뷰에 캡 추가 (fan triangulation)
-  function buildVisualHull(silhouettes, viewAngles) {
+  function buildVisualHull(silhouettes, viewAngles, options = {}) {
+    const subdivisions = options.subdivisions || 18; // 뷰 간 중간 레이어 수
+
     // 포인트 수를 균일하게 맞추기 위해 가장 적은 수로 리샘플링
     const minLen = Math.min(...silhouettes.map(s => s.length));
     const resampled = silhouettes.map(sil => resamplePoints(sil, minLen));
 
-    const vertices = [];
-    const faces = [];
-    const viewOffsets = []; // 각 뷰의 시작 인덱스
-
-    // 1. 각 뷰의 실루엣 포인트를 3D 공간에 배치
-    for (let i = 0; i < resampled.length; i++) {
-      const sil = resampled[i];
-      const angle = viewAngles[i];
+    // Step 1: 각 뷰의 실루엣을 중심점 기준 각도 정렬
+    const sortedSilhouettes = resampled.map((sil, viewIdx) => {
+      const angle = viewAngles[viewIdx];
       const rad = angle * Math.PI / 180;
-      const cos = Math.cos(rad);
-      const sin = Math.sin(rad);
+      const cos = Math.cos(rad), sin = Math.sin(rad);
 
-      viewOffsets.push(vertices.length);
-      for (const p of sil) {
-        const wx = p.x * cos - p.z * sin;
-        const wy = p.y;
-        const wz = p.x * sin + p.z * cos;
-        vertices.push({ x: wx, y: wy, z: wz });
+      // 월드 좌표 변환
+      const worldPts = sil.map(p => ({
+        x: p.x * cos - p.z * sin,
+        y: p.y,
+        z: p.x * sin + p.z * cos
+      }));
+
+      // 중심점 계산
+      let cx = 0, cy = 0, cz = 0;
+      for (const p of worldPts) { cx += p.x; cy += p.y; cz += p.z; }
+      cx /= worldPts.length; cy /= worldPts.length; cz /= worldPts.length;
+
+      // 실루엣 평면에서 각도 정렬
+      const bx = cos, bz = sin;
+      const sorted = worldPts.map((p) => {
+        const dx = p.x - cx, dy = p.y - cy, dz = p.z - cz;
+        const u = dx * bx + dz * bz;
+        const v = dy;
+        return { angle: Math.atan2(v, u), point: p };
+      }).sort((a, b) => a.angle - b.angle);
+
+      return sorted.map(s => s.point);
+    });
+
+    // Step 2: 인접 뷰 간 최적 회전 오프셋 탐색 (엣지 길이 최소화)
+    const n = sortedSilhouettes[0].length;
+    const rotations = [0];
+
+    for (let i = 1; i < sortedSilhouettes.length; i++) {
+      const prev = sortedSilhouettes[i - 1];
+      const curr = sortedSilhouettes[i];
+
+      let bestOffset = 0;
+      let bestCost = Infinity;
+
+      for (let offset = 0; offset < n; offset++) {
+        let cost = 0;
+        for (let j = 0; j < n; j++) {
+          const p1 = prev[j];
+          const p2 = curr[(j + offset) % n];
+          const dx = p1.x - p2.x, dy = p1.y - p2.y, dz = p1.z - p2.z;
+          cost += dx * dx + dy * dy + dz * dz;
+        }
+        if (cost < bestCost) {
+          bestCost = cost;
+          bestOffset = offset;
+        }
+      }
+
+      rotations.push(bestOffset);
+    }
+
+    // Step 3: 뷰 간 중간 레이어 보간 (메시 밀집화)
+    // 각 뷰와 중간 레이어를 하나의 "레이어 스택"으로 구성
+    const layers = []; // 각 레이어는 n개의 3D 포인트
+
+    for (let i = 0; i < sortedSilhouettes.length; i++) {
+      const sil = sortedSilhouettes[i];
+      const offset = rotations[i];
+
+      // 현재 뷰의 레이어 추가
+      const currentLayer = [];
+      for (let j = 0; j < sil.length; j++) {
+        const idx = (j + offset) % sil.length;
+        currentLayer.push(sil[idx]);
+      }
+      layers.push(currentLayer);
+
+      // 다음 뷰와의 중간 레이어 추가
+      if (i < sortedSilhouettes.length - 1) {
+        const nextSil = sortedSilhouettes[i + 1];
+        const nextOffset = rotations[i + 1];
+
+        for (let k = 1; k <= subdivisions; k++) {
+          const t = k / (subdivisions + 1);
+          const midLayer = [];
+          for (let j = 0; j < n; j++) {
+            const idxA = (j + offset) % n;
+            const idxB = (j + nextOffset) % n;
+            const pA = sil[idxA];
+            const pB = nextSil[idxB];
+            midLayer.push({
+              x: pA.x + (pB.x - pA.x) * t,
+              y: pA.y + (pB.y - pA.y) * t,
+              z: pA.z + (pB.z - pA.z) * t
+            });
+          }
+          layers.push(midLayer);
+        }
       }
     }
 
-    // 2. 인접 뷰 간의 포인트를 연결하여 측면 메시 생성
-    // 모든 뷰가 동일한 포인트 수를 가지므로 1:1 연결 가능
-    for (let i = 0; i < resampled.length - 1; i++) {
-      const lenA = resampled[i].length;
-      const lenB = resampled[i + 1].length;
-      const offsetA = viewOffsets[i];
-      const offsetB = viewOffsets[i + 1];
+    // Step 4: 레이어 스택으로 메시 구성
+    const vertices = [];
+    const faces = [];
+    const layerOffsets = [];
+
+    for (let i = 0; i < layers.length; i++) {
+      layerOffsets.push(vertices.length);
+      for (const p of layers[i]) {
+        vertices.push(p);
+      }
+    }
+
+    // Step 5: 인접 레이어 간 연결
+    for (let i = 0; i < layers.length - 1; i++) {
+      const lenA = layers[i].length;
+      const lenB = layers[i + 1].length;
+      const offsetA = layerOffsets[i];
+      const offsetB = layerOffsets[i + 1];
       const segCount = Math.max(lenA, lenB);
 
       for (let j = 0; j < segCount; j++) {
@@ -87,16 +177,14 @@
         const idxB = offsetB + (j % lenB);
         const idxA2 = offsetA + ((j + 1) % lenA);
         const idxB2 = offsetB + ((j + 1) % lenB);
-        // 두 개의 삼각형으로 쿼드 구성
         faces.push([idxA, idxB, idxB2]);
         faces.push([idxA, idxB2, idxA2]);
       }
     }
 
-    // 3. 양 끝 뷰에 캡 추가 (fan triangulation)
-    // 첫 번째 뷰 (front)
-    const firstOffset = viewOffsets[0];
-    const firstLen = resampled[0].length;
+    // Step 6: 양 끝 레이어에 캡 추가 (fan triangulation)
+    const firstOffset = layerOffsets[0];
+    const firstLen = layers[0].length;
     const firstCenter = vertices.length;
     let firstCx = 0, firstCy = 0, firstCz = 0;
     for (let i = 0; i < firstLen; i++) {
@@ -113,9 +201,8 @@
       faces.push([firstCenter, firstOffset + i, firstOffset + next]);
     }
 
-    // 마지막 뷰 (back)
-    const lastOffset = viewOffsets[viewOffsets.length - 1];
-    const lastLen = resampled[resampled.length - 1].length;
+    const lastOffset = layerOffsets[layerOffsets.length - 1];
+    const lastLen = layers[layers.length - 1].length;
     const lastCenter = vertices.length;
     let lastCx = 0, lastCy = 0, lastCz = 0;
     for (let i = 0; i < lastLen; i++) {
