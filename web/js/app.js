@@ -253,6 +253,31 @@
     statusText.textContent = `메쉬 생성 완료: ${vCount} vertices, ${fCount} faces`;
   });
 
+  // ── M13: Demon 실루엣 로드 버튼 ──
+  const btnDemon = document.getElementById('btn-demon');
+  btnDemon.addEventListener('click', () => {
+    const demonSilhouettes = global.DemonData.silhouettes;
+    const silhouettes = [demonSilhouettes.front, demonSilhouettes.deg45, demonSilhouettes.side, demonSilhouettes.back];
+    const viewAngles = [0, 45, 90, 180];
+
+    // Visual Hull 메시 생성
+    let mesh = Mesh.buildVisualHull(silhouettes, viewAngles);
+
+    // Watertight 패치
+    mesh = Mesh.buildWatertightCaps(mesh);
+
+    // 상태에 저장
+    state.visualHullMesh = mesh;
+
+    // 렌더링
+    draw();
+    updateStatus();
+
+    const vCount = mesh.vertices.length;
+    const fCount = mesh.faces.length;
+    statusText.textContent = `Demon 메쉬 생성: ${vCount} vertices, ${fCount} faces`;
+  });
+
   // ── 입력 컨트롤러 ──
   inputController = Input.createInputController(canvas, state, onStrokeComplete);
 
