@@ -313,8 +313,110 @@
   // 점이 visual hull 내부인지 판정 (Ray Casting)
   // ═══════════════════════════════════════════
 
-  // 점이 메시 내부에 있는지 판정 (even-odd rule)
+  // 메시 법선 일관성 수정 (BFS 기반)
+  function fixNormalConsistency(mesh) {
+    const newVertices = mesh.vertices.map(v => ({ ...v }));
+    const newFaces = mesh.faces.map(f => [...f]);
+
+    // 엣지 → 면 매핑
+    const edgeToFaces = new Map();
+    for (let fi = 0; fi < newFaces.length; fi++) {
+      const face = newFaces[fi];
+      for (let i = 0; i < 3; i++) {
+        const a = face[i], b = face[(i + 1) % 3];
+        const key = a < b ? `${a}_${b}` : `${b}_${a}`;
+        if (!edgeToFaces.has(key)) edgeToFaces.set(key, []);
+        edgeToFaces.get(key).push(fi);
+      }
+    }
+
+    // 면 법선 계산
+    const faceNormals = newFaces.map(face => {
+      const v0 = newVertices[face[0]];
+      const v1 = newVertices[face[1]];
+      const v2 = newVertices[face[2]];
+      const e1 = { x: v1.x - v0.x, y: v1.y - v0.y, z: v1.z - v0.z };
+      const e2 = { x: v2.x - v0.x, y: v2.y - v0.y, z: v2.z - v0.z };
+      const n = {
+        x: e1.y * e2.z - e1.z * e2.y,
+        y: e1.z * e2.x - e1.x * e2.z,
+        z: e1.x * e2.y - e1.y * e2.x
+      };
+      const len = Math.sqrt(n.x * n.x + n.y * n.y + n.z * n.z);
+      if (len > 0.000001) { n.x /= len; n.y /= len; n.z /= len; }
+      return n;
+    });
+
+    // BFS로 인접 면 법선 방향 맞추기
+    const visited = new Set();
+    const queue = [0];
+    visited.add(0);
+
+    while (queue.length > 0) {
+      const fi = queue.shift();
+      const face = newFaces[fi];
+
+      for (let i = 0; i < 3; i++) {
+        const a = face[i], b = face[(i + 1) % 3];
+        const key = a < b ? `${a}_${b}` : `${b}_${a}`;
+        const neighbors = edgeToFaces.get(key) || [];
+
+        for (const ni of neighbors) {
+          if (ni === fi || visited.has(ni)) continue;
+
+          // 인접 면과 법선 방향 비교
+          const n1 = faceNormals[fi];
+          const n2 = faceNormals[ni];
+          const dot = n1.x * n2.x + n1.y * n2.y + n1.z * n2.z;
+
+          // 법선이 반대면 면 뒤집기
+          if (dot < -0.01) {
+            const nf = newFaces[ni];
+            newFaces[ni] = [nf[0], nf[2], nf[1]];
+            faceNormals[ni] = { x: -n2.x, y: -n2.y, z: -n2.z };
+          }
+
+          visited.add(ni);
+          queue.push(ni);
+        }
+      }
+    }
+
+    // 전체 법선이 바깥을 향하도록 조정 (중심점에서 멀어지는 방향)
+    let cx = 0, cy = 0, cz = 0;
+    for (const v of newVertices) { cx += v.x; cy += v.y; cz += v.z; }
+    cx /= newVertices.length; cy /= newVertices.length; cz /= newVertices.length;
+
+    let outwardCount = 0;
+    for (let i = 0; i < newFaces.length; i++) {
+      const face = newFaces[i];
+      const v0 = newVertices[face[0]];
+      const v1 = newVertices[face[1]];
+      const v2 = newVertices[face[2]];
+      const fx = (v0.x + v1.x + v2.x) / 3;
+      const fy = (v0.y + v1.y + v2.y) / 3;
+      const fz = (v0.z + v1.z + v2.z) / 3;
+      const n = faceNormals[i];
+      const toCenter = { x: cx - fx, y: cy - fy, z: cz - fz };
+      if (n.x * toCenter.x + n.y * toCenter.y + n.z * toCenter.z < 0) outwardCount++;
+    }
+
+    // 과반이 안쪽을 향하면 전체 뒤집기
+    if (outwardCount < newFaces.length / 2) {
+      for (let i = 0; i < newFaces.length; i++) {
+        const f = newFaces[i];
+        newFaces[i] = [f[0], f[2], f[1]];
+      }
+    }
+
+    return { vertices: newVertices, faces: newFaces };
+  }
+
+  // 점이 메시 내부에 있는지 판정 (Winding Number 알고리즘)
   function isInsideVisualHull(point, mesh) {
+    // 법선 일관성 먼저 수정
+    const fixedMesh = fixNormalConsistency(mesh);
+
     // 메시의 바운딩 박스 계산
     let minX = Infinity, maxX = -Infinity;
     let minY = Infinity, maxY = -Infinity;
@@ -334,15 +436,54 @@
       return false;
     }
 
-    // X축 방향 레이 캐스팅
-    const rayDir = { x: 1, y: 0, z: 0 };
-    let intersections = 0;
-    for (const face of mesh.faces) {
-      if (rayIntersectsTriangle(point, rayDir, face, mesh.vertices)) {
-        intersections++;
-      }
+    // Winding Number 계산
+    let windingNumber = 0;
+    for (const face of fixedMesh.faces) {
+      const v0 = fixedMesh.vertices[face[0]];
+      const v1 = fixedMesh.vertices[face[1]];
+      const v2 = fixedMesh.vertices[face[2]];
+
+      // 점에서 삼각형 각 정점으로의 벡터
+      const a = { x: v0.x - point.x, y: v0.y - point.y, z: v0.z - point.z };
+      const b = { x: v1.x - point.x, y: v1.y - point.y, z: v1.z - point.z };
+      const c = { x: v2.x - point.x, y: v2.y - point.y, z: v2.z - point.z };
+
+      // 벡터 크기
+      const lenA = Math.sqrt(a.x*a.x + a.y*a.y + a.z*a.z);
+      const lenB = Math.sqrt(b.x*b.x + b.y*b.y + b.z*b.z);
+      const lenC = Math.sqrt(c.x*c.x + c.y*c.y + c.z*c.z);
+
+      // 점이 정점 위에 있으면 내부로 간주
+      if (lenA < 0.0001 || lenB < 0.0001 || lenC < 0.0001) return true;
+
+      // 삼각형의 입체각 계산 (winding number 기여분)
+      const crossAB = {
+        x: a.y*b.z - a.z*b.y,
+        y: a.z*b.x - a.x*b.z,
+        z: a.x*b.y - a.y*b.x
+      };
+      const crossBC = {
+        x: b.y*c.z - b.z*c.y,
+        y: b.z*c.x - b.x*c.z,
+        z: b.x*c.y - b.y*c.x
+      };
+      const crossCA = {
+        x: c.y*a.z - c.z*a.y,
+        y: c.z*a.x - c.x*a.z,
+        z: c.x*a.y - c.y*a.x
+      };
+
+      const dotABC = crossAB.x*crossBC.x + crossAB.y*crossBC.y + crossAB.z*crossBC.z;
+      const det = a.x*(b.y*c.z - b.z*c.y) + a.y*(b.z*c.x - b.x*c.z) + a.z*(b.x*c.y - b.y*c.x);
+      const denom = lenA*lenB*lenC + lenA*(b.x*c.x + b.y*c.y + b.z*c.z) + lenB*(a.x*c.x + a.y*c.y + a.z*c.z) + lenC*(a.x*b.x + a.y*b.y + a.z*b.z);
+
+      if (Math.abs(denom) < 0.000001) continue;
+      const angle = 2 * Math.atan2(det, denom);
+      windingNumber += angle;
     }
-    return intersections % 2 === 1;
+
+    // Winding Number가 0이 아니면 내부
+    return Math.abs(windingNumber) > 1;
   }
 
   // 레이-삼각형 교차 판정
