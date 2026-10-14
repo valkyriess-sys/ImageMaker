@@ -412,12 +412,8 @@
     return { vertices: newVertices, faces: newFaces };
   }
 
-  // 점이 메시 내부에 있는지 판정 (Winding Number 알고리즘)
-  function isInsideVisualHull(point, mesh) {
-    // 법선 일관성 먼저 수정
-    const fixedMesh = fixNormalConsistency(mesh);
-
-    // 메시의 바운딩 박스 계산
+  // 메시 바운딩 박스 계산
+  function computeBoundingBox(mesh) {
     let minX = Infinity, maxX = -Infinity;
     let minY = Infinity, maxY = -Infinity;
     let minZ = Infinity, maxZ = -Infinity;
@@ -429,16 +425,64 @@
       if (v.z < minZ) minZ = v.z;
       if (v.z > maxZ) maxZ = v.z;
     }
+    return { minX, maxX, minY, maxY, minZ, maxZ };
+  }
+
+  // 메시별 법선 일관성 수정 캐시 (WeakMap — mesh 1회만 fix)
+  const fixedMeshCache = new WeakMap();
+
+  // 점이 메시 내부에 있는지 판정 (Winding Number 알고리즘)
+  function isInsideVisualHull(point, mesh) {
+    // 캐시 확인 — 메시당 1회만 fixNormalConsistency 실행
+    let cached = fixedMeshCache.get(mesh);
+    if (!cached) {
+      const fixedMesh = fixNormalConsistency(mesh);
+      const bbox = computeBoundingBox(mesh);
+
+      // 면 bounding sphere 캐시 (winding number early-out용)
+      const faceSpheres = new Array(fixedMesh.faces.length);
+      for (let i = 0; i < fixedMesh.faces.length; i++) {
+        const face = fixedMesh.faces[i];
+        const v0 = fixedMesh.vertices[face[0]];
+        const v1 = fixedMesh.vertices[face[1]];
+        const v2 = fixedMesh.vertices[face[2]];
+        const cx = (v0.x + v1.x + v2.x) / 3;
+        const cy = (v0.y + v1.y + v2.y) / 3;
+        const cz = (v0.z + v1.z + v2.z) / 3;
+        let r = 0;
+        for (const idx of face) {
+          const v = fixedMesh.vertices[idx];
+          const dx = v.x - cx, dy = v.y - cy, dz = v.z - cz;
+          const d = Math.sqrt(dx*dx + dy*dy + dz*dz);
+          if (d > r) r = d;
+        }
+        faceSpheres[i] = { cx, cy, cz, r };
+      }
+
+      cached = { fixedMesh, bbox, faceSpheres };
+      fixedMeshCache.set(mesh, cached);
+    }
+    const { fixedMesh, bbox, faceSpheres } = cached;
+
     // 바운딩 박스 밖이면 외부
-    if (point.x < minX || point.x > maxX ||
-        point.y < minY || point.y > maxY ||
-        point.z < minZ || point.z > maxZ) {
+    if (point.x < bbox.minX || point.x > bbox.maxX ||
+        point.y < bbox.minY || point.y > bbox.maxY ||
+        point.z < bbox.minZ || point.z > bbox.maxZ) {
       return false;
     }
 
     // Winding Number 계산
     let windingNumber = 0;
-    for (const face of fixedMesh.faces) {
+    for (let i = 0; i < fixedMesh.faces.length; i++) {
+      const sphere = faceSpheres[i];
+
+      // 면 bounding sphere에서 멀리 떨어진 면은 winding number 기여가 0에 가까움 → skip
+      const sdx = sphere.cx - point.x, sdy = sphere.cy - point.y, sdz = sphere.cz - point.z;
+      const distSq = sdx*sdx + sdy*sdy + sdz*sdz;
+      const threshold = sphere.r * 100;
+      if (distSq > threshold * threshold) continue;
+
+      const face = fixedMesh.faces[i];
       const v0 = fixedMesh.vertices[face[0]];
       const v1 = fixedMesh.vertices[face[1]];
       const v2 = fixedMesh.vertices[face[2]];
@@ -457,23 +501,6 @@
       if (lenA < 0.0001 || lenB < 0.0001 || lenC < 0.0001) return true;
 
       // 삼각형의 입체각 계산 (winding number 기여분)
-      const crossAB = {
-        x: a.y*b.z - a.z*b.y,
-        y: a.z*b.x - a.x*b.z,
-        z: a.x*b.y - a.y*b.x
-      };
-      const crossBC = {
-        x: b.y*c.z - b.z*c.y,
-        y: b.z*c.x - b.x*c.z,
-        z: b.x*c.y - b.y*c.x
-      };
-      const crossCA = {
-        x: c.y*a.z - c.z*a.y,
-        y: c.z*a.x - c.x*a.z,
-        z: c.x*a.y - c.y*a.x
-      };
-
-      const dotABC = crossAB.x*crossBC.x + crossAB.y*crossBC.y + crossAB.z*crossBC.z;
       const det = a.x*(b.y*c.z - b.z*c.y) + a.y*(b.z*c.x - b.x*c.z) + a.z*(b.x*c.y - b.y*c.x);
       const denom = lenA*lenB*lenC + lenA*(b.x*c.x + b.y*c.y + b.z*c.z) + lenB*(a.x*c.x + a.y*c.y + a.z*c.z) + lenC*(a.x*b.x + a.y*b.y + a.z*b.z);
 
@@ -529,8 +556,27 @@
   // - 메시 A의 각 면이 메시 B 내부에 있는지 판정
   // - 메시 B의 각 면이 메시 A 내부에 있는지 판정
   function checkOverlay(meshA, meshB) {
+    // self-overlay 최적화: mesh A와 mesh B가 같은 메시면 전체 면이 교차
+    if (meshA === meshB) {
+      const totalFaces = meshA.faces.length;
+      const allFaces = new Array(totalFaces);
+      for (let i = 0; i < totalFaces; i++) allFaces[i] = i;
+      return {
+        meshAOverlayCount: totalFaces,
+        meshBOverlayCount: totalFaces,
+        meshAOverlayFaces: allFaces,
+        meshBOverlayFaces: allFaces.slice(),
+        overlayRatioA: 1.0,
+        overlayRatioB: 1.0
+      };
+    }
+
     const overlayFacesA = [];
     const overlayFacesB = [];
+
+    // mesh B의 bounding box 사전 계산 (early-out용)
+    const bboxB = computeBoundingBox(meshB);
+    const bboxA = computeBoundingBox(meshA);
 
     for (let i = 0; i < meshA.faces.length; i++) {
       const face = meshA.faces[i];
@@ -544,6 +590,10 @@
       cx /= face.length;
       cy /= face.length;
       cz /= face.length;
+      // bounding box 밖이면 skip (isInsideVisualHull 내부에서도 하지만 명시적 check로 overhead 절약)
+      if (cx < bboxB.minX || cx > bboxB.maxX ||
+          cy < bboxB.minY || cy > bboxB.maxY ||
+          cz < bboxB.minZ || cz > bboxB.maxZ) continue;
       if (isInsideVisualHull({ x: cx, y: cy, z: cz }, meshB)) {
         overlayFacesA.push(i);
       }
@@ -560,6 +610,9 @@
       cx /= face.length;
       cy /= face.length;
       cz /= face.length;
+      if (cx < bboxA.minX || cx > bboxA.maxX ||
+          cy < bboxA.minY || cy > bboxA.maxY ||
+          cz < bboxA.minZ || cz > bboxA.maxZ) continue;
       if (isInsideVisualHull({ x: cx, y: cy, z: cz }, meshA)) {
         overlayFacesB.push(i);
       }
